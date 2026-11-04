@@ -98,13 +98,15 @@ curl --proxy "$HTTPS_PROXY" -fL https://github.com/ZYY-ing/bench-web-plus/releas
 bash start-fleet.sh
 ```
 
-没有可用代理但 CDN 可达时，可下载整个源码 ZIP：
+GitHub 页面不可用、但源码下载域名可达时，可下载整个源码 ZIP：
 
 ```bash
 curl -fL https://codeload.github.com/ZYY-ing/bench-web-plus/zip/refs/heads/main -o bench-web-plus-source.zip
 ```
 
 Runner 压缩包还提供 [jsDelivr 备用地址](https://cdn.jsdelivr.net/gh/ZYY-ing/bench-web-plus@main/dist/ascend-bench-fleet-kit.tar.gz)，但它**不是完整管理员工具包**；CDN 可能延迟，不用它判断 GitHub 是否已发布。
+
+若管理员电脑使用 HTTP 内网 pip 源，还需设置 `PIP_TRUSTED_HOST` 为该源域名；优先使用可信 HTTPS 源。这是电脑侧 pip 设置，与网页中的服务器安装网络设置分别生效。
 
 企业网络需要自签 CA 时，由管理员将可信 CA 配到电脑 / 容器，电脑 pip 可用 `PIP_CERT`、curl 可用 `--cacert`。本教程不要求关闭 TLS 验证。
 
