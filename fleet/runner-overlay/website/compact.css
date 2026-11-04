@@ -1,0 +1,24 @@
+/* 紧凑微调：小屏收敛与细节 */
+@media (max-width:900px){
+  aside{width:64px;flex:0 0 64px;padding:14px 8px}
+  .brand span:not(.mark),.navlabel,.workspace,.sidebottom p,.sidebottom small,.sidebottom b{display:none}
+  .nav{padding:10px 8px;text-align:center;font-size:12px}
+  .content{padding:16px 14px 32px}
+  .titleline h1{font-size:22px}
+}
+#datasetGate{background:#fbfcfe}
+.gated .datasettoolbar,.gated #datasetList,.gated .datasetPreparation,.gated #performanceData{transition:opacity .2s}
+.metric b{font-variant-numeric:tabular-nums}
+.metric span{display:block}
+#results .panelhead h2{flex:1}
+.summary dd{word-break:break-all}
+.historyitem summary:hover{color:var(--accent)}
+#logs::-webkit-scrollbar,.artifactfile pre::-webkit-scrollbar,.tablewrap::-webkit-scrollbar{width:8px;height:8px}
+#logs::-webkit-scrollbar-thumb,.artifactfile pre::-webkit-scrollbar-thumb,.tablewrap::-webkit-scrollbar-thumb{background:#33415c;border-radius:4px}
+.tablewrap::-webkit-scrollbar-thumb{background:#c9d4e0}
+table td:last-child,table th:last-child{text-align:right}
+#executionArtifacts{margin-top:6px}
+
+.workflow-fields{border:0;padding:0;margin:0;min-width:0}.workflow-fields:disabled{opacity:.5}.workflow-fields:disabled input,.workflow-fields:disabled select,.workflow-fields:disabled button,.workflow-fields:disabled textarea{cursor:not-allowed}a{color:inherit}
+
+[hidden]{display:none!important}

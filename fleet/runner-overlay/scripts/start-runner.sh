@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE="${ASCEND_BENCH_HOME:-/home/ascend_bench/runner}"
+PORT="${ASCEND_BENCH_PORT:-18787}"
+CONTAINER="${ASCEND_BENCH_CONTAINER:-<容器名>}"
+if [ ! -d "$BASE/scripts" ]; then
+  echo "ASCEND_BENCH_HOME 目录不存在或不完整: $BASE（请先运行 setup.sh 安装）" >&2
+  exit 1
+fi
+cd "$BASE"
+mkdir -p logs tmp cache
+export ASCEND_BENCH_HOME="$BASE" HOME="$BASE" TMPDIR="$BASE/tmp" XDG_CACHE_HOME="$BASE/cache" PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$BASE/scripts${PYTHONPATH:+:$PYTHONPATH}"
+# Runner 与测试请求全部直连本机/内网服务，不走企业代理（否则 504 HIS Proxy Notification）
+export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+
+# 探测可达的服务 IP（用于隧道提示；容器 host 网络时 127.0.0.1 即宿主机回环）
+HOST_IP="$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("8.8.8.8",80));print(s.getsockname()[0])' 2>/dev/null || hostname -I | awk '{print $1}')"
+
+if [ "${ASCEND_BENCH_MANAGED:-0}" = 1 ]; then
+  echo "正在启动 Runner；中心将自动核对身份并接入，无需手工建隧道。"
+else
+cat <<EOF
+
+================================================================
+ Runner 启动中！剩下 3 步（全在浏览器，无需改服务器文件）：
+----------------------------------------------------------------
+ [你的电脑] 1. 建隧道（本地端口随意，多机时各用不同本地端口避免冲突）:
+    ssh -N -o ExitOnForwardFailure=yes -L <本地端口>:127.0.0.1:$PORT <SSH用户>@$HOST_IP
+    例: 单机 -L 18787:...；多机则机器1=18787、机器2=18788、机器3=18789
+ [你的电脑] 2. 打开 http://127.0.0.1:<本地端口>
+    登录 token 见: $BASE/runner-token（仅在可信终端读取）
+ [网站内]   3. 「步骤1 连接推理服务」填 服务 IP / 端口 / 模型名 / tokenizer 路径
+    → 点「检查连接」→ 步骤2 选数据集 → 步骤3 参数 → 开始测试
+----------------------------------------------------------------
+ 验证:  docker exec $CONTAINER curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:$PORT/
+ 日志:  docker exec $CONTAINER tail -f $BASE/logs/runner.log
+================================================================
+EOF
+fi
+
+nohup python3 scripts/runner.py < /dev/null >> logs/runner.log 2>&1 &
+sleep 2
+if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "Runner 健康检查通过（http://127.0.0.1:$PORT/）"
+else
+  echo "Runner 未就绪（可能仍在启动），查看日志: docker exec $CONTAINER tail -20 $BASE/logs/runner.log" >&2
+fi

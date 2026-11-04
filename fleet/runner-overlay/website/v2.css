@@ -1,0 +1,72 @@
+/* v0.2 组件：面板 / 表单 / 数据集列表 / 概览卡 */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px 18px 20px;margin-bottom:16px}
+.panelhead{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.panelhead h2{font-size:15.5px;flex:1}
+.panelhead .muted{font-size:10.5px;letter-spacing:.14em;color:#9aa7b8}
+.panelhead .badge{font-size:11px;background:#fff;border:1px solid var(--line);color:var(--ink-soft);border-radius:999px;padding:2px 10px}
+.livepoint{color:var(--accent);animation:pulse 1.6s infinite}
+@keyframes pulse{50%{opacity:.35}}
+
+label{font-size:12.5px;color:var(--ink-soft);display:block}
+input,select,textarea{width:100%;margin-top:4px;padding:9px 10px;border:1px solid #cfd8e3;border-radius:9px;font:inherit;font-size:13.5px;color:var(--ink);background:#fff;transition:.15s}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px #0eaa7220}
+input[type=checkbox]{width:auto;margin:0}
+textarea{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;min-height:64px;resize:vertical}
+.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin:8px 0}
+.formgrid.three{grid-template-columns:repeat(3,1fr)}
+.formgrid.compactapi{grid-template-columns:2fr 1fr;align-items:end}
+@media (max-width:760px){.formgrid,.formgrid.three,.formgrid.compactapi{grid-template-columns:1fr}}
+.boolfield{display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.boolfield code{font-size:11.5px;color:var(--ink-soft)}
+input[type=checkbox][role=switch]{appearance:none;width:38px;height:21px;border-radius:999px;background:#ccd6e2;position:relative;cursor:pointer;transition:.2s;flex:0 0 auto}
+input[type=checkbox][role=switch]::after{content:"";position:absolute;top:2.5px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:.2s}
+input[type=checkbox][role=switch]:checked{background:var(--accent)}
+input[type=checkbox][role=switch]:checked::after{left:19px}
+.switchrow{display:flex;justify-content:space-between;align-items:center;gap:14px;border-top:1px dashed var(--line);padding:10px 2px}
+.switchrow b{font-size:13.5px}
+.switchrow p{font-size:12px;color:var(--ink-soft)}
+.connection{display:flex;justify-content:space-between;align-items:center;gap:12px;background:#f7fafb;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:10px}
+.connection span{font-size:13px;color:var(--ink-soft)}
+.hint{font-size:12px;color:var(--ink-soft);margin-top:8px}
+.hint.center{text-align:center}
+.extrashead{display:flex;justify-content:space-between;align-items:baseline;margin-top:12px}
+details.compactadvanced{border-top:1px dashed var(--line);margin-top:10px;padding-top:8px}
+.executiontarget{border:1px dashed var(--line);border-radius:10px;padding:10px 12px;margin:10px 0}
+#aisSettings label{display:block;margin:8px 0 4px}
+
+/* 数据集 */
+.datasettoolbar{display:flex;gap:8px;margin-bottom:10px}
+.datasettoolbar input{margin-top:0}
+.datasetlist{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.datasetrow{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:#fff;border:1px solid var(--line);border-radius:11px;padding:10px 12px;cursor:pointer;transition:.15s}
+.datasetrow:hover{border-color:var(--accent)}
+.datasetrow.selected{border-color:var(--accent);background:var(--accent-soft)}
+.listRadio{color:var(--accent);font-size:13px}
+.datasetname{flex:1;min-width:0}
+.datasetname b{display:block;font-size:13.5px}
+.datasetname small{color:var(--ink-soft);font-size:11.5px}
+.state{font-size:11px;border-radius:999px;padding:2px 9px;white-space:nowrap;background:#f1f4f8;color:var(--ink-soft)}
+.state-ready{background:var(--accent-soft);color:#0b7a52}
+.state-missing{background:#fdf1e7;color:#b0621a}
+.state-unchecked{background:#f1f4f8}
+.state-unadapted,.state-blocked{background:#f7edf0;color:#a13a4c}
+.datasetPreparation{border-top:1px dashed var(--line);padding-top:12px}
+.datasetcheck{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.datasetcheck b{font-size:14px}
+.datasetcheck p{font-size:12.5px;color:var(--ink-soft);word-break:break-all}
+.datasetactions{display:flex;gap:8px;margin-top:10px}
+#prepareDetail{margin-top:8px}
+#prepareDetail p{font-size:11.5px;color:var(--ink-soft);word-break:break-all}
+
+/* 右侧概览 */
+.summary dl{display:grid;gap:6px;margin:4px 0 12px}
+.summary dt{font-size:11.5px;color:#9aa7b8}
+.summary dd{font-size:13.5px}
+.enginebox{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:12px;background:#fafbfd}
+.enginebox span{font-size:11px;color:var(--accent);letter-spacing:.08em}
+.enginebox h3{font-size:14.5px;margin:3px 0}
+.enginebox p{font-size:12px;color:var(--ink-soft);margin-bottom:8px}
+.enginebox select{margin-top:2px}
+.ready{display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--ink-soft);margin-bottom:10px}
+.ready span:first-child{color:var(--accent)}
+.summary .primary{width:100%;padding:12px}
