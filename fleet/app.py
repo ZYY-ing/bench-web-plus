@@ -2,6 +2,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import ipaddress
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import ssl
 import threading
 import time
 from urllib.parse import urlsplit
@@ -18,6 +20,9 @@ import uuid
 
 from .transport import Transport, load_profiles, validate_spec, validate_install_network
 from . import bootstrap
+from .accounts import Accounts
+from .persistent import Channels
+from .http_server import BoundedServer
 from .session_ssh import SessionSSH, RemoteCommandError, probe, validate_endpoint, INSPECT_SCRIPT
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,9 +32,12 @@ PICKER_HTML = '''<section class="panel" id="fleetPicker" style="margin-bottom:20
 
 def workbench_html(runner_id=None):
     raw = (ROOT / 'fleet/runner-overlay/website/index.html').read_text(encoding='utf-8')
+    raw = raw.replace('Plus · v0.1', '共享中心 · v0.2')
+    raw = raw.replace('https://github.com/ZYY-ing/bench-web-plus#用户使用教程', '/guide/')
     raw = re.sub(r'步骤([123])', lambda m: '步骤' + str(int(m[1]) + 1), raw)
     raw = raw.replace('<section class="content">', '<section class="content">' + PICKER_HTML)
     raw = raw.replace('<div id="editor"', '<div inert aria-disabled="true" id="editor"')
+    raw = raw.replace('<a id="guide"', '<a href="/admin/" style="margin-right:16px">管理员登录</a><a id="guide"')
     raw = raw.replace('</head>', '<style>#editor[inert]{opacity:.45;pointer-events:none}</style></head>')
     scripts = '<script src="/fleet-picker.js"></script>'
     if runner_id:
@@ -38,7 +46,7 @@ def workbench_html(runner_id=None):
 
 
 class Store:
-    def __init__(self, directory):
+    def __init__(self, directory, recover=True):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(directory / 'fleet.sqlite3', check_same_thread=False)
         self.db.execute('CREATE TABLE IF NOT EXISTS objects(id TEXT PRIMARY KEY, kind TEXT, body TEXT)')
@@ -46,7 +54,7 @@ class Store:
         (directory / 'fleet.sqlite3').chmod(0o600)
         self.lock = threading.RLock()
         # A center restart never implies that an install or test has stopped.
-        for task in self.list('deployment'):
+        for task in (self.list('deployment') if recover else []):
             if task['state'] not in ('ready', 'failed', 'unknown'):
                 task.update(state='unknown', detail='中心重启，远端可能仍在安装；请核对后重试')
                 self.save('deployment', task)
@@ -90,11 +98,15 @@ class Console:
         self.config_path = config
         self.directory = directory
         self.store = Store(directory)
+        self.accounts = Accounts(self.store)
+        self.session_admin = {}
+        self.session_revisions = {}
         self.profiles = load_profiles(config, tool_only=True) if not demo else [{
             'id': 'demo-1', 'name': 'HY4 · 测试服务器', 'host': '192.0.2.10', 'user': 'demo',
             'containers': ['ascend-test'], 'base_roots': ['/home/benchops/ascend-bench'],
             'runner_ports': [18787, 18788], 'ais_paths': []}]
         self.transport = Transport(self.profiles)
+        self.transport.channels = Channels(directory)
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.mutex = threading.RLock()
         self.archive = archive or ROOT / 'dist/ascend-bench-fleet-kit.tar.gz'
@@ -107,6 +119,9 @@ class Console:
         self.user_sessions = {}
         self.login_attempts = []
         self.machine_inventory = {}
+        self.refresh_locks = {}
+        self.refresh_times = {}
+        self.refresh_versions = {}
         if demo and not self.store.list('runner'):
             spec = {'profile_id': 'demo-1', 'container': 'ascend-test', 'base': '/home/benchops/ascend-bench', 'port': 18787, 'ais_path': ''}
             rid = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
@@ -206,7 +221,14 @@ class Console:
                 raise ValueError('宿主机挂载路径无效')
         return {'profile_id': profile['id'], 'container': container, 'base': base, 'port': port, 'ais_path': '',
                 'container_mode': mode, 'image': image, 'host_path': host_path, 'package_dir': package_dir,
-                'network': validate_install_network(body.get('network', {}))}
+                'network': validate_install_network(body.get('network', {})), 'durable': body.get('durable') is True,
+                'access_port': self.access_port(body.get('access_port', port + 1000), port)}
+
+    @staticmethod
+    def access_port(value, runner_port):
+        if type(value) is not int or not 1 <= value <= 65535 or value == runner_port:
+            raise ValueError('受限接入端口需要为与 Runner 不同的有效端口')
+        return value
 
     def inspect_machine(self, profile_id):
         bases = {r['spec']['container']: r['spec']['base'] for r in self.store.list('runner') + self.store.list('removed-runner') if r['spec']['profile_id'] == profile_id}
@@ -343,10 +365,10 @@ class Console:
             step(state, '部署未完成：' + reason)
 
     def runners(self):
-        return [{k: v for k, v in r.items() if k != 'token'} for r in self.store.list('runner')]
+        return [{**{k: v for k, v in r.items() if k != 'token'}, 'access_configured':self.transport.channels.has(r['spec'])} for r in self.store.list('runner')]
 
     def user_view(self):
-        profiles = [{k: p[k] for k in ('id', 'name', 'host', 'connected')} for p in self.public_profiles()]
+        profiles = [{**{k: p[k] for k in ('id', 'name', 'host', 'connected')}, 'connected': p['connected'] or self.transport.channels.has_profile(p['id'])} for p in self.public_profiles()]
         entries = self.runners()
         runners = [{'id': r['id'], 'spec': {k: r['spec'][k] for k in ('profile_id', 'port', 'container')},
                     'status': {**{k: r['status'].get(k) for k in ('activity', 'version')},
@@ -366,7 +388,21 @@ class Console:
             self.store.save('removed-runner', runner)
         return {'ok': True, 'detail': '已移出测试环境；容器、安装目录、Runner进程和测试结果保留，重新部署可接回'}
 
-    def refresh(self, runner_id):
+    def refresh(self, runner_id, force=False):
+        with self.mutex:
+            lock = self.refresh_locks.setdefault(runner_id, threading.Lock())
+            requested_version = self.refresh_versions.get(runner_id, 0)
+        with lock:
+            observed = self.refresh_times.get(runner_id, 0)
+            if time.monotonic() - observed < .5 and (not force or self.refresh_versions.get(runner_id, 0) > requested_version):
+                return {k:v for k,v in self.store.get('runner', runner_id).items() if k != 'token'}
+            result = self.refresh_once(runner_id)
+            if not result.get('error'):
+                self.refresh_times[runner_id] = time.monotonic()
+                self.refresh_versions[runner_id] = self.refresh_versions.get(runner_id, 0) + 1
+            return result
+
+    def refresh_once(self, runner_id):
         runner = self.store.get('runner', runner_id)
         try:
             if not self.demo:
@@ -401,7 +437,7 @@ class Console:
         self.log(task, '按需核对确认 Runner 已就绪')
         return task
 
-    def proxy(self, runner_id, method, path, body):
+    def proxy(self, runner_id, method, path, body, owner=None):
         if self.demo:
             raise ValueError('演示模式不连接真实 Runner；请用真实模式测试部署与评测')
         runner = self.store.get('runner', runner_id)
@@ -437,6 +473,8 @@ class Console:
                 with self.mutex:
                     self.store.get('runner', runner_id)
                     self.store.claim(runner_id, target_key, request_id)
+                    if owner:
+                        self.store.save('job-owner', {'id':'job-owner:'+request_id, 'owner':owner, 'runner':runner_id})
                 body['fleet_request_id'] = request_id
         if profile.get('mode') in ('restricted', 'session'):
             return self.transport.request(spec, method, path, body)
@@ -489,22 +527,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Referrer-Policy', 'no-referrer')
         if cookie:
+            if getattr(self.server, 'tls', False):
+                cookie += '; Secure'
             self.send_header('Set-Cookie', cookie)
         self.end_headers()
         self.wfile.write(content)
 
     def handle_request(self, method):
         try:
+            networks = getattr(self.server, 'allowed_networks', None)
+            client_ip = ipaddress.ip_address(self.client_address[0])
+            if networks and not client_ip.is_loopback and not any(client_ip in network for network in networks):
+                return self.send(403, {'error':'此来源不在中心允许的访问网段中'})
             host = self.headers.get('Host', '')
-            if host not in (f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'):
+            allowed_hosts = getattr(self.server, 'allowed_hosts', {f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'})
+            scheme = 'https' if getattr(self.server, 'tls', False) else 'http'
+            if host not in allowed_hosts:
                 return self.send(403, {'error': '仅允许本机访问'})
             origin = self.headers.get('Origin')
-            if origin and origin != 'http://' + host:
+            if origin and origin != scheme + '://' + host:
                 return self.send(403, {'error': 'Origin 不匹配'})
             path = urlsplit(self.path).path
-            if method == 'GET' and path in ('/', '/style.css', '/app.js'):
-                file = STATIC / {'/': 'index.html', '/style.css': 'style.css', '/app.js': 'app.js'}[path]
-                mime = {'/': 'text/html; charset=utf-8', '/style.css': 'text/css; charset=utf-8', '/app.js': 'text/javascript; charset=utf-8'}[path]
+            if method == 'GET' and path == '/guide/':
+                return self.send(200, (ROOT / 'docs/SHARED_CENTER.md').read_bytes(), 'text/plain; charset=utf-8')
+            if method == 'GET' and path == '/':
+                self.send_response(302)
+                self.send_header('Location', '/workbench/')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            if method == 'GET' and path in ('/admin/', '/style.css', '/app.js'):
+                file = STATIC / {'/admin/': 'index.html', '/style.css': 'style.css', '/app.js': 'app.js'}[path]
+                mime = {'/admin/': 'text/html; charset=utf-8', '/style.css': 'text/css; charset=utf-8', '/app.js': 'text/javascript; charset=utf-8'}[path]
                 return self.send(200, file.read_bytes(), mime)
             body = None
             if method == 'POST':
@@ -517,7 +571,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ValueError('请求必须为 JSON 对象')
             if path == '/api/mode' and method == 'GET':
-                return self.send(200, {'demo': self.app.demo})
+                return self.send(200, {'demo': self.app.demo, 'accounts_configured': bool(self.app.accounts.list())})
             if path == '/api/login' and method == 'POST':
                 now = time.time()
                 with self.app.mutex:
@@ -525,16 +579,32 @@ class Handler(BaseHTTPRequestHandler):
                     if len(self.app.login_attempts) >= 10:
                         return self.send(429, {'error': '尝试过多，请一分钟后重试'})
                     self.app.login_attempts.append(now)
+                username = body.get('username', '')
+                with self.app.store.lock:
+                    account_ok = self.app.accounts.authenticate(username, body.get('password', '')) if username else False
+                    account_revision = self.app.accounts.revision(username) if account_ok else 0
                 supplied_token = str(body.get('token', '')).strip().encode('utf-8')
                 expected_token = ('demo' if self.app.demo else self.app.token).encode('utf-8')
-                if not secrets.compare_digest(supplied_token, expected_token):
-                    return self.send(403, {'error': '访问凭据不匹配。请粘贴 console-token 文件中的完整字符串，不是文件路径或说明文字。'})
+                bootstrap_ok = (self.app.demo or not self.app.accounts.list()) and secrets.compare_digest(supplied_token, expected_token)
+                if not (account_ok or bootstrap_ok):
+                    return self.send(403, {'error': '管理员账号或密码不匹配' if username or self.app.accounts.list() else '访问凭据不匹配。请粘贴 console-token 文件中的完整字符串，不是文件路径或说明文字。'})
                 session, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
                 self.app.sessions[session] = (csrf, now + 12 * 3600)
+                self.app.session_admin[session] = username if account_ok else 'bootstrap'
+                self.app.session_revisions[session] = account_revision
                 return self.send(200, {'csrf': csrf}, cookie=f'fleet_session_{self.server.server_port}={session}; HttpOnly; SameSite=Strict; Path=/')
             cookie = SimpleCookie(self.headers.get('Cookie', ''))
             user_cookie = cookie.get(f'fleet_user_{self.server.server_port}')
-            user = self.app.user_sessions.get(user_cookie.value) if user_cookie else None
+            with self.app.mutex:
+                user = self.app.user_sessions.get(user_cookie.value) if user_cookie else None
+                if not user and user_cookie:
+                    try:
+                        user = self.app.store.get('user-session', 'user-session:' + user_cookie.value)
+                        # Ownership survives restart; stale selection and refresh do not.
+                        user.update(refreshed={}, selected=None)
+                        self.app.user_sessions[user_cookie.value] = user
+                    except ValueError:
+                        user = None
             if user and user['expires'] < time.time():
                 user = None
             if path == '/api/user/bootstrap' and method == 'GET':
@@ -542,12 +612,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not user:
                     sid = secrets.token_urlsafe(32)
                     user = {'csrf': secrets.token_urlsafe(24), 'expires': time.time() + 12 * 3600,
-                            'refreshed': {}, 'selected': None}
+                            'id':'user-session:' + sid, 'refreshed': {}, 'selected': None, 'owner': secrets.token_urlsafe(24)}
                     with self.app.mutex:
                         self.app.user_sessions = {k: v for k, v in self.app.user_sessions.items() if v['expires'] > time.time()}
-                        if len(self.app.user_sessions) >= 256:
-                            self.app.user_sessions.pop(next(iter(self.app.user_sessions)))
                         self.app.user_sessions[sid] = user
+                        self.app.store.save('user-session', user)
+                        with self.app.store.lock, self.app.store.db:
+                            self.app.store.db.execute("DELETE FROM objects WHERE kind='user-session' AND json_extract(body,'$.expires') < ?", (time.time(),))
                     new_cookie = f'fleet_user_{self.server.server_port}={sid}; HttpOnly; SameSite=Strict; Path=/'
                 return self.send(200, {**self.app.user_view(), 'csrf': user['csrf'],
                                        'selected_runner_id': user['selected']}, cookie=new_cookie)
@@ -576,14 +647,40 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, asset.read_bytes(), 'text/css' if asset_name.endswith('.css') else 'text/javascript')
             session = cookie.get(f'fleet_session_{self.server.server_port}')
             admin_auth = self.app.sessions.get(session.value) if session else None
+            actor = self.app.session_admin.get(session.value) if session else None
+            if actor and actor != 'bootstrap' and (not self.app.accounts.enabled(actor) or self.app.session_revisions.get(session.value) != self.app.accounts.revision(actor)):
+                admin_auth = None
+            if actor == 'bootstrap' and self.app.accounts.list() and not self.app.demo:
+                admin_auth = None
             user_route = path.startswith('/api/user/') or bool(route)
             auth = (user['csrf'], user['expires']) if user_route and user else admin_auth
             if not auth or auth[1] < time.time():
-                return self.send(401, {'error': '请刷新用户页面' if user_route else '请登录本机控制台'})
+                return self.send(401, {'error': '请刷新用户页面' if user_route else '请登录管理员'})
             if method == 'POST' and not secrets.compare_digest(self.headers.get('X-CSRF-Token', '').encode('utf-8'), auth[0].encode('utf-8')):
                 return self.send(403, {'error': 'CSRF 校验失败，请重新登录'})
+            if method == 'POST' and not user_route:
+                self.app.store.save('audit', {'id': 'audit:' + uuid.uuid4().hex, 'actor': actor or 'legacy', 'path': path, 'time': time.time()})
+            if path == '/api/admins' and method == 'GET':
+                return self.send(200, {'administrators': self.app.accounts.list()})
+            if path == '/api/admins' and method == 'POST':
+                first = not self.app.accounts.list()
+                result = self.app.accounts.create(body.get('username'), body.get('password'))
+                return self.send(201, {**result, 'requires_login': first and not self.app.demo})
+            if path == '/api/admins/password' and method == 'POST':
+                self.app.accounts.password(body.get('username'), body.get('password'))
+                return self.send(200, {'ok': True})
+            if path == '/api/admins/enable' and method == 'POST':
+                self.app.accounts.enable(body.get('username'))
+                return self.send(200, {'ok': True})
+            if path == '/api/admins/disable' and method == 'POST':
+                self.app.accounts.disable(body.get('username'))
+                return self.send(200, {'ok': True})
+            if path == '/api/audit' and method == 'GET':
+                return self.send(200, {'events': self.app.store.list('audit')[:200]})
             if path == '/api/logout' and method == 'POST':
                 self.app.sessions.pop(session.value, None)
+                self.app.session_admin.pop(session.value, None)
+                self.app.session_revisions.pop(session.value, None)
                 return self.send(200, {'ok': True}, cookie=f'fleet_session_{self.server.server_port}=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/')
             if path == '/api/user/refresh' and method == 'POST' and user:
                 result = self.app.refresh(body['runner_id'])
@@ -596,13 +693,14 @@ class Handler(BaseHTTPRequestHandler):
                 rid = body.get('runner_id')
                 if time.time() - user['refreshed'].get(rid, 0) > 60:
                     raise ValueError('请先刷新状态，再选择 Runner；状态超过60秒后需重新刷新')
-                result = self.app.refresh(rid)
+                result = self.app.refresh(rid, force=True)
                 profile = self.app.transport.profiles[result['spec']['profile_id']]
-                if result.get('error') or profile.get('mode') == 'session' and profile['id'] not in self.app.transport.sessions:
+                if result.get('error') or profile.get('mode') == 'session' and profile['id'] not in self.app.transport.sessions and not self.app.transport.channels.has(result['spec']):
                     raise ValueError('Runner 连接不可用，请联系管理员恢复连接')
                 if result['status'].get('activity') != 'idle':
                     raise ValueError('Runner 当前非空闲，请刷新后选择其他 Runner')
                 user['selected'] = rid
+                self.app.store.save('user-session', user)
                 return self.send(200, {'runner_id': rid})
             if method == 'GET' and path == '/fleet-picker.js':
                 return self.send(200, (STATIC / 'fleet-picker.js').read_bytes(), 'text/javascript; charset=utf-8')
@@ -646,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 rid, tail = match.groups()
                 self.app.store.get('runner', rid)
-                if method == 'POST' and user and user.get('selected') != rid:
+                if method == 'POST' and user and user.get('selected') != rid and not tail.endswith('/stop'):
                     return self.send(403, {'error': '请先刷新状态并选择此 Runner'})
                 kit = ROOT / 'fleet/runner-overlay'
                 if method == 'GET' and tail == '/':
@@ -660,7 +758,20 @@ class Handler(BaseHTTPRequestHandler):
                 allowed = (method == 'GET' and (tail in ('/api/info', '/api/config', '/api/jobs') or re.fullmatch(r'/api/jobs/real-[a-z0-9-]+', tail))) or (method == 'POST' and (tail in ('/api/check-service', '/api/jobs', '/api/datasets/check', '/api/datasets/prepare', '/api/datasets/generate', '/api/config') or re.fullmatch(r'/api/jobs/real-[a-z0-9-]+/stop', tail)))
                 if not allowed:
                     raise ValueError('不支持的代理接口')
-                status, mime, raw = self.app.proxy(rid, method, tail, body)
+                if method == 'POST' and tail.endswith('/stop') and user and not (admin_auth and admin_auth[1] > time.time()):
+                    job_path = tail[:-5]
+                    _, _, record_raw = self.app.proxy(rid, 'GET', job_path, None)
+                    request_id = json.loads(record_raw).get('fleet_request_id')
+                    try:
+                        ownership = self.app.store.get('job-owner', 'job-owner:' + str(request_id))
+                    except ValueError:
+                        return self.send(403, {'error':'此任务需由发起用户或管理员停止'})
+                    if not user.get('owner') or ownership['owner'] != user['owner'] or ownership['runner'] != rid:
+                        return self.send(403, {'error':'只能停止自己发起的任务；其他任务请联系管理员'})
+                if method == 'POST' and tail == '/api/jobs' and user:
+                    status, mime, raw = self.app.proxy(rid, method, tail, body, owner=user.get('owner'))
+                else:
+                    status, mime, raw = self.app.proxy(rid, method, tail, body)
                 return self.send(status, raw, mime)
             return self.send(404, {'error': '页面不存在'})
         except (ValueError, KeyError, TypeError) as exc:
@@ -677,16 +788,58 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--port', type=int, default=19881)
+    parser.add_argument('--port', type=int)
     parser.add_argument('--config', type=Path, default=ROOT / 'fleet-config.json')
     parser.add_argument('--data', type=Path)
     parser.add_argument('--demo', action='store_true')
+    parser.add_argument('--bind')
+    parser.add_argument('--public-url')
+    parser.add_argument('--cert', type=Path)
+    parser.add_argument('--key', type=Path)
+    parser.add_argument('--allow-net', action='append', default=[])
     args = parser.parse_args()
+    directory = args.data or ROOT / ('.fleet-demo' if args.demo else '.fleet-data')
+    settings_path = directory / 'listen.json'
+    settings = json.loads(settings_path.read_text(encoding='utf-8')) if settings_path.exists() else {}
+    args.port = args.port or settings.get('port', 19881)
+    args.bind = args.bind or settings.get('bind', '127.0.0.1')
+    args.public_url = args.public_url or settings.get('public_url', '')
+    args.cert = args.cert or (Path(settings['cert']) if settings.get('cert') else None)
+    args.key = args.key or (Path(settings['key']) if settings.get('key') else None)
+    if type(args.port) is not int or not 1 <= args.port <= 65535:
+        parser.error('中心端口无效')
+    if bool(args.cert) != bool(args.key):
+        parser.error('需要同时提供 --cert 和 --key')
+    external = args.bind not in ('127.0.0.1', 'localhost', '::1')
+    public = urlsplit(args.public_url)
+    if external and (not args.cert or public.scheme != 'https' or not public.hostname or public.username or public.password or public.path not in ('', '/') or public.query or public.fragment):
+        parser.error('共享模式需要 HTTPS 证书和明确的 --public-url https://域名或IP:端口')
+    if external and args.demo:
+        parser.error('演示模式只允许本机访问')
+    networks = [ipaddress.ip_network(value, strict=False) for value in (args.allow_net or settings.get('allowed_networks', []))]
+    if external and (not networks or any(net.prefixlen == 0 for net in networks)):
+        parser.error('共享模式需要明确的 --allow-net 允许网段，不允许全部互联网来源')
     app = Console(args.config, args.data or ROOT / ('.fleet-demo' if args.demo else '.fleet-data'), args.demo)
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    if external and not app.accounts.list():
+        parser.error('请先运行 python -m fleet.admin create 管理员账号')
+    server = BoundedServer((args.bind, args.port), Handler)
+    server.allowed_networks = networks
+    server.tls = bool(args.cert)
+    server.allowed_hosts = {f'127.0.0.1:{args.port}', f'localhost:{args.port}'}
+    if args.public_url:
+        if public.port not in (None, args.port):
+            parser.error('public-url 端口必须与监听端口一致，不隐式信任反向代理头')
+        server.allowed_hosts.add(public.netloc)
+        if args.port == 443 and args.cert:
+            server.allowed_hosts.add(public.hostname if ':' not in public.hostname else '['+public.hostname+']')
+    if args.cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(args.cert, args.key)
+        server.tls_context = context
     server.daemon_threads = True
     server.app = app
-    print(f'本机控制台：http://127.0.0.1:{args.port}', flush=True)
+    print('中心地址：' + (args.public_url or f"{'https' if args.cert else 'http'}://127.0.0.1:{args.port}"), flush=True)
     print(f'凭据文件：{app.directory / "console-token"}（请在本机读取并登录）', flush=True)
     print('模式：' + ('演示，不连接服务器' if args.demo else '真实 SSH 部署'), flush=True)
     try:

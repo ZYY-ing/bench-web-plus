@@ -1,4 +1,5 @@
 .fleet-data/
+.fleet-data.backup-*/
 .fleet-demo/
 .fleet-deps/
 fleet-config.json

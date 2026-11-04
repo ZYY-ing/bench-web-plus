@@ -8,3 +8,5 @@
 #machineFields{border:0;padding:0;margin:0;min-width:0}.connection-state{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 0}.connection-state .status{margin:0}.card-footer div{display:flex;gap:8px;flex-wrap:wrap}.heading>.primary{margin-left:auto}header #logout{padding:6px 10px;font-size:10px}
 
 .side-bottom{margin-top:auto}
+
+#accountsList .history-row{grid-template-columns:minmax(120px,1fr)80px auto;overflow-wrap:anywhere}#resetAdminPassword{margin-left:8px}

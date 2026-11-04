@@ -44,7 +44,8 @@ def validate_request(request, spec):
 def forward(request, spec):
     method, path, body = validate_request(request, spec)
     # Token stays on the server; not present in the enrollment receipt or on the PC.
-    token = subprocess.check_output(['docker', 'exec', spec['container'], 'cat', spec['base'] + '/runner-token'], stderr=subprocess.DEVNULL, timeout=15).decode().strip()
+    token = (Path(spec['token_file']).read_text().strip() if spec.get('token_file') else
+             subprocess.check_output(['docker', 'exec', spec['container'], 'cat', spec['base'] + '/runner-token'], stderr=subprocess.DEVNULL, timeout=15).decode().strip())
     headers = {'Host': '127.0.0.1:' + str(spec['port']), 'Cookie': 'runner_session_' + str(spec['port']) + '=' + token}
     data = None if body is None else json.dumps(body).encode()
     if data is not None:

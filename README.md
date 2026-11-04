@@ -1,4 +1,20 @@
-# Bench Web Plus
+# Bench Web Plus · 共享中心预览版
+
+共享中心预览版本为 **v0.2.0-preview.1**。建议在新目录部署验证；v0.1.1 为历史本机版。
+
+**团队只部署一个中心，安装在一台常开个人电脑上。其他管理员和普通用户只用浏览器。** 同一网址默认进入免登录用户界面，管理员点击登录入口，用各自账号和密码进入管理页。
+
+新版本的安装、后台运行、证书、允许网段、多管理员和服务器接入教程，请看 **[共享中心部署说明](docs/SHARED_CENTER.md)**。
+
+- **[下载共享中心安装包](https://github.com/ZYY-ing/bench-web-plus/releases/download/v0.2.0-preview.1/bench-web-plus-shared-preview.zip)**（约7.5 MB；不含 Python、模型和全部离线依赖）。
+- [下载 SHA256 校验文件](https://github.com/ZYY-ing/bench-web-plus/releases/download/v0.2.0-preview.1/bench-web-plus-shared-preview.zip.sha256)。
+- [首次部署问题与重新配置](docs/CENTER_TROUBLESHOOTING.md) · [共享中心交接记录](docs/SHARED_HANDOFF.md)。
+
+新电脑先安装 Python 3.12+，再双击 `setup-shared-center.cmd`。Python 下载、PATH、证书、内外网依赖和允许网段步骤见[部署说明](docs/SHARED_CENTER.md)。
+
+以下保留 v0.1.1 历史说明，仅作兼容回溯；与新说明不同的地方，以共享中心部署说明为准。
+
+## 历史版本：v0.1.1 本机版
 
 基于 [ascend-bench-web](https://github.com/ZYY-ing/ascend-bench-web) 的多机 Runner 网页管理与模型评测工具。
 

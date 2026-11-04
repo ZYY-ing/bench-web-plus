@@ -107,6 +107,7 @@ class Transport:
         self.lock = threading.Lock()
         self.helper = (HERE / 'remote_helper.py').read_text(encoding='utf-8')
         self.sessions = {}
+        self.channels = None
 
     def options(self, profile):
         return ['-F', 'none', '-o', 'IdentityAgent=none', '-o', 'GlobalKnownHostsFile=none',
@@ -121,6 +122,11 @@ class Transport:
 
     def request(self, spec, method, path, body=None):
         p = self.profiles[spec['profile_id']]
+        if self.channels and self.channels.has(spec):
+            result = self.channels.request(spec, method, path, body)
+            if result.get('error'):
+                raise ValueError('持久评测连接不可用，请管理员检查')
+            return result['status'], result['content_type'], base64.b64decode(result['body'], validate=True)
         if p.get('mode') == 'session':
             gateway = (HERE / 'gateway.py').read_text(encoding='utf-8').split("if __name__ == '__main__':")[0]
             gateway_spec = {**spec, 'service_hosts': p.get('service_hosts', [p['host'], '127.0.0.1', 'localhost']),
@@ -209,6 +215,8 @@ class Transport:
                 payload['release'] = json.load(package.extractfile('ascend-bench-kit/fleet-release.json'))
             script = self.helper + '\n' + (HERE / 'direct_worker.py').read_text(encoding='utf-8') + '\ndirect_main(json.loads(' + repr(json.dumps(payload)) + '))\n'
             session.execute(script, timeout=2700, log=log)
+            if spec.get('durable'):
+                self.channels.install(session, spec, p, log)
             step('health', '核对 Runner 身份、版本、健康和空闲状态')
             return self.status(spec)
         if p.get('mode') in ('restricted', 'session'):
