@@ -5,7 +5,7 @@
 **新部署请使用当前 `main` 的完整源码。旧 Release 是历史快照，不包含本次会话的全部修复。** 中心无需 Node.js、前端编译、Docker 或 NPU；其他管理员与用户的电脑仅需浏览器。
 
 - [中心部署详细说明](docs/SHARED_CENTER.md) · [首次部署排障](docs/CENTER_TROUBLESHOOTING.md)
-- [本次完整会话交接与当前行为](docs/SESSION_HANDOFF_20261107.md) · [历史交接入口](docs/HANDOFF.md)
+- [当前交接与验证边界](docs/HANDOFF.md) · [文档索引](docs/README.md)
 - [匿名化工具与原生 AISBench 对照实验](docs/experiments/2026-11-07-aisbench-tool-native-ab.md)
 
 ## 工作方式

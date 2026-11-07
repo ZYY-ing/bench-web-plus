@@ -1,14 +1,14 @@
 # 中心首次部署、重新配置与排障
 
-> 新部署请下载当前 main 源码，操作总入口见[README](../README.md)。历史 Release 与早期验收不是当前版本；最终行为及回退决定见[完整交接](SESSION_HANDOFF_20261107.md)。
+> 当前操作总入口见[README](../README.md)，实现与验证边界见[当前交接](HANDOFF.md)，其他文档见[索引](README.md)。
 
 
-适用于 v0.2.0-preview.1。示例地址和路径必须改成实际值；不包含实际机器凭据。
+适用于当前 main 源码。示例地址和路径必须改成实际值；不包含实际机器凭据。
 
 ## 新电脑推荐顺序
 
 1. 只有选定的中心电脑安装Python 3.12+（包含pip）与工具包；其他管理员和用户只需要浏览器。团队通常保留一个有效中心，不在每个管理员电脑重复安装。
-2. 从本版本Release下载ZIP和SHA256文件，解压到本人可写的新目录。完整Python官网下载安装和PATH说明见 [共享中心部署说明](SHARED_CENTER.md)。
+2. 从当前 main 下载完整源码 ZIP，或使用当前源码构建的完整分发包，解压到本人可写的新目录。完整Python官网下载安装和PATH说明见 [共享中心部署说明](SHARED_CENTER.md)。
 3. 双击 setup-shared-center.cmd。填写固定HTTPS网址、实际用户网段、首个管理员账号和密码；选择公司证书或生成测试证书。密码输入不显示字符或星号，输入后按回车，长度12–256字符。
 4. 安装器创建当前Windows用户登录后运行的任务。确认任务运行、中心端口监听；管理员网页可关闭，但中心电脑仍需登录Windows、联网且不休眠。
 5. 由有权限者按实际用户网段放行中心TCP端口。测试证书需在访问电脑信任 .fleet-data/tls/ca.pem；不跳过浏览器安全警告，不分发私钥或整个数据目录。
@@ -108,9 +108,9 @@ Rename-Item -LiteralPath '.fleet-data' -NewName ('.fleet-data.backup-' + (Get-Da
 ```
 
 不要盲删其他目录或未知后台任务。备份含账号校验值、接入凭据和私钥，只留在受保护位置，不上传。重置中心不会停止或删除服务器容器、Runner、连接组件或结果；旧服务器接入应由管理员核对后重新登记。新的中心CA需要重新信任；也不要把旧电脑整个 .fleet-data 发给其他用户。
-## 80 网段安装故障（2026-11-05）
+## 容器 Python、ensurepip 与线程兼容
 
-192.0.2.137 的请求线程段错误，以及 192.0.2.155 的 Python/ensurepip 与旧 Docker 线程兼容问题，见 [原因、修复与实测](RUNNER_80_DEPLOYMENT_20261105.md)。
+安装时需要验证所选 Python、venv/ensurepip 和实际 AISBench 启动能力，不能仅凭路径存在判断可用。换容器后依赖环境按完整容器 ID 隔离；不复用另一个容器失效的解释器链接。老 Docker 的 clone3/seccomp 限制由进程级兼容处理，不要求 privileged 或关闭 seccomp。仍有段错误时保留日志和底层异常，停止安装，不修改他人的模型环境。
 
 ## 持久 SSH 部署在“检查共享路径安装包缓存”时中断
 
@@ -132,7 +132,7 @@ Rename-Item -LiteralPath '.fleet-data' -NewName ('.fleet-data.backup-' + (Get-Da
 
 HTTP Runner 的评测进程启用 `ASCEND_BENCH_API_ONLY=1`，在进程内禁用不需要的 `torch_npu` 可选后端，防止 MMEngine 显式导入它并初始化 NPU。仅设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 无法阻止 MMEngine 的直接导入。安装预检会加载实际 AISBench 依赖并创建线程；不修改服务端 vLLM、NPU 驱动或全局 Python 包。
 
-完整实测、性能 token 长度校验和 tokenizer 配置问题见 [精度/性能修复记录](SCORING_FIX_20261105.md)。
+当前参数规则、tokenizer 可见性与验证范围见[交接文档](HANDOFF.md)。
 
 ## 大型性能数据集生成超过 30 秒
 
@@ -140,7 +140,7 @@ HTTP Runner 的评测进程启用 `ASCEND_BENCH_API_ONLY=1`，在进程内禁用
 
 中心现仅对 `/api/datasets/generate` 保存同一份请求参数，在读取结果超时后继续确认缓存。Runner 的生成锁阻止重复并行生成，完成后校验参数对应的缓存并返回。初次就遇到忙碌仍立即提示；参数错误、认证和证书错误不做自动重试。测试任务提交及部署命令不套用这一逻辑。
 
-确认等待有 30 分钟预算；超过预算会明确说明后台生成未被取消，可用完全相同的参数稍后确认。不要为了等待生成而停止 Runner 或重复部署。实测结果见 [最终验收记录](FINAL_ACCEPTANCE_20261105.md)。
+确认等待有 30 分钟预算；超过预算会明确说明后台生成未被取消，可用完全相同的参数稍后确认。不要为了等待生成而停止 Runner 或重复部署。实测范围见[交接文档](HANDOFF.md#验证证据与不能宣称的事项)。
 
 ## 多用户生成、测试和共享缓存互锁（2026-11-07）
 

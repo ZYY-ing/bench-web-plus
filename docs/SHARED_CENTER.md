@@ -1,6 +1,6 @@
 # 共享中心部署详细说明（当前源码）
 
-> 新部署请下载当前 main 源码，操作总入口见[README](../README.md)。历史 Release 与早期验收不是当前版本；最终行为及回退决定见[完整交接](SESSION_HANDOFF_20261107.md)。
+> 新部署下载当前 main 源码，操作总入口见[README](../README.md)，实现与验证边界见[当前交接](HANDOFF.md)，其他文档见[索引](README.md)。
 
 
 中心安装在一台常开个人电脑上。普通用户免登录打开统一网址；管理员使用各自账号登录管理页。关闭管理员网页或退出管理员不会关闭中心和 Runner 连接。
@@ -199,13 +199,12 @@ HTTPS 包源默认使用中心操作系统信任的公共 CA 证书：部署时�
 
 本机 HTTP 调试仍可运行 `start-fleet.cmd --port 19883`，默认只监听回环。正式共享必须配置 HTTPS 与允许网段；调试端口不能当作局域网共享入口。
 
-自动回归检查覆盖管理员部署、Runner 身份核对、占用释放及用户选择流程。`tools/acceptance_verify.py` 另外提供隔离中心的实机验收：通过真实 HTTP 管理员/用户接口部署专用测试容器、调用已有 vLLM 服务，并归档真实任务日志与指标。每项通过情况以该次运行生成的 `ACCEPTANCE_REPORT.md` 和 `results.json` 为准，不能把接口回放当作模型测试结果。
+自动回归检查覆盖管理员部署、Runner 身份核对、占用释放、数据集生成、参数透传、清理与用户选择流程。检查命令如下；Node 仅用于开发回归，不是中心运行依赖。
 
-```bash
-python -m fleet.setup_admin
-python -m unittest fleet.test_fleet fleet.test_shared
-node fleet/test_picker.cjs
-python -m fleet.package --name bench-web-plus-shared-preview.zip
+```powershell
+python -m unittest discover -s fleet -t . -p 'test_*.py'
+Get-ChildItem fleet -Filter 'test_*.cjs' | ForEach-Object { node $_.FullName; if ($LASTEXITCODE) { throw "前端测试失败" } }
+python -m fleet.package --name bench-web-plus-shared-current.zip
 ```
 
-[实现与验收交接](HANDOFF.md)。后台任务定义已检查，实际 Windows 任务注册权限、公司证书和第二台个人电脑的浏览器互访仍需在正式中心环境确认。
+[当前交接](HANDOFF.md)列出实机范围与未完成项。本地回归通过不替代实际中心的证书、网络、任务权限及服务器环境验证。
