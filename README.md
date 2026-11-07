@@ -48,6 +48,15 @@
 
 安装完整 Python **3.12+**（包含 pip），确认 `python --version` 与 `python -m pip --version` 正常；不要使用 Windows 商店占位入口。当前共享中心与 Windows 无人登录开机方案有实机使用记录；其他系统不要直接照搬 Windows 服务步骤。
 
+在后续操作使用的 PowerShell 中固定解释器路径，下面的维护命令会使用它：
+
+```powershell
+$env:FLEET_PYTHON = (Get-Command python -CommandType Application).Source
+& $env:FLEET_PYTHON --version
+```
+
+如果 Python 没在 PATH 中，直接将第一行右侧改成带引号的实际 `python.exe` 完整路径。
+
 有 Git：
 
 ```powershell
