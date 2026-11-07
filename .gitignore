@@ -8,3 +8,5 @@ __pycache__/
 *.tmp
 outputs/
 wheelhouse*/
+# Local machine-specific operations and private experiment material are not releases.
+/tools/

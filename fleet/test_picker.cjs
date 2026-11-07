@@ -14,7 +14,8 @@ async function check(unavailable){
   const runner={id:'a'.repeat(16),spec:{profile_id:'host',container:'test-container',port:18787},status:{activity:'idle'},error:unavailable?'unavailable':''};
   const context={profiles:[{id:'host',host:'192.0.2.1',connected:true}],runners:[runner],csrf:'test-csrf'};
   const events={};const window={dispatchEvent(){},addEventListener(name,fn){events[name]=fn;}};
-  const sandbox={window,document:{getElementById:id=>id==='fleetPicker'?panel:editor,createElement:()=>new Element(),head:new Element()},location:{pathname:'/r/'+runner.id+'/'},Event:class {},switchMode(){},mode:'accuracy',setTimeout:()=>1,clearTimeout(){},fetch:async path=>({ok:!unavailable||!path.endsWith('/refresh'),json:async()=>path.endsWith('/bootstrap')?context:{error:'offline'}})};
+  let reloads=0;const timeouts=[];
+  const sandbox={window,document:{getElementById:id=>id==='fleetPicker'?panel:editor,createElement:()=>new Element(),head:new Element()},location:{pathname:'/r/'+runner.id+'/',reload(){reloads++}},AbortController,Event:class {},switchMode(){},mode:'accuracy',setTimeout:(fn,ms)=>{if(ms===20000)timeouts.push(fn);return 1},clearTimeout(){},fetch:async path=>({ok:!unavailable||!path.endsWith('/refresh'),json:async()=>path.endsWith('/bootstrap')?context:{error:'offline'}})};
   vm.runInNewContext(readFileSync(__dirname+'/static/fleet-picker.js','utf8'),sandbox);
   await window.fleetReady;
   assert.equal(select.disabled,false);
@@ -28,9 +29,24 @@ async function check(unavailable){
   select.value=runner.id;select.onchange();
   assert.equal(use.disabled,unavailable);
   assert.equal(editor.inert,true); // selection alone does not authorize a job
+  if(!unavailable){
+    await use.onclick();
+    assert.equal(reloads,1); // confirming the same Runner must reload, not navigate to the same hash
+    assert.match(message.textContent,/已确认空闲/);
+    const fetch=sandbox.fetch;
+    sandbox.fetch=(path,options)=>path.endsWith('/select')?new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'})))):fetch(path,options);
+    const attempt=use.onclick();
+    assert.equal(use.disabled,true);
+    timeouts.at(-1)();
+    await attempt;
+    assert.match(message.textContent,/超时/);
+    assert.equal(use.disabled,false);
+    assert.equal(editor.inert,true);
+    sandbox.fetch=fetch;
+  }
   context.runners=[];await events.focus();
   assert.equal(select.children.length,1);
   assert.equal(use.disabled,true);
   assert.equal(editor.inert,true);
 }
-(async()=>{await check(true);await check(false);console.log('Runner picker: unavailable list, refresh gating, selection and admin removal checks passed');})().catch(e=>{console.error(e);process.exitCode=1;});
+(async()=>{await check(true);await check(false);console.log('Runner picker: unavailable list, selection, same-page reload, timeout recovery and removal checks passed');})().catch(e=>{console.error(e);process.exitCode=1;});

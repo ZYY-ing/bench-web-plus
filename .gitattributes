@@ -7,3 +7,4 @@
 *.md text eol=lf
 *.tar.gz -text
 *.zip -text
+*.whl -text

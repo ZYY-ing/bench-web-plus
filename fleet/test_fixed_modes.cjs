@@ -1,0 +1,14 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const ParameterEngine=require('./runner-overlay/website/params.js');
+for(const text of ['mode=eval','execution.mode=eval','generation_kwargs.mode="eval"'])assert.throws(()=>ParameterEngine.parse(text));
+assert.equal(ParameterEngine.parse('reuse=latest')[0].target,'execution.reuse');
+const source=fs.readFileSync(__dirname+'/runner-overlay/website/config.js','utf8');
+assert(source.includes("(perf?['perf']:['all'])"));assert(!source.includes('perfViz'));
+const body=source.slice(source.indexOf('function readConfig('),source.indexOf('config=()=>readConfig'));
+const values={port:'8000',maxout:'64',batch:'1',temperature:'0',retry:'2',limit:'1',inputTokens:'16384',requests:'16',seed:'42',host:'127.0.0.1',model:'test',path:'/test',engine:'aisbench',endpoint:'chat',timeoutMode:'native',executionTarget:'direct',aisbenchPath:'ais_bench',pressureTime:'15',warmupOutput:'64',warmups:'0',extraParams:'',runMode:'eval'};
+const nodes=new Map();const $=id=>{if(!nodes.has(id))nodes.set(id,{value:values[id]||'0',checked:false,checkValidity:()=>true,closest:()=>({textContent:id})});return nodes.get(id)};
+let entries=[];const c=vm.createContext({$,mode:'accuracy',warmupOutputCustom:false,structuredClone,ParameterEngine,currentDataset:()=>({name:'GSM8K',size:1}),validateExtras:()=>entries});vm.runInContext(body,c);
+assert.equal(vm.runInContext('readConfig(true)',c).execution.mode,'all');c.mode='performance';assert.equal(vm.runInContext('readConfig(true)',c).execution.mode,'perf');
+entries=[{key:'injected',target:'execution.mode',value:'perf_viz'}];assert.throws(()=>vm.runInContext('readConfig(true)',c),/仅支持/);
+entries=ParameterEngine.parse('reuse=latest');assert.equal(vm.runInContext('readConfig(true)',c).execution.reuse,'latest');
+console.log('Fixed modes: accuracy all, performance perf, extra-parameter rejection and request override guards passed');

@@ -2,8 +2,14 @@
 let runnerConnected=false, realRecord=null, runnerInfo=null;
 records=[];$('count').textContent='0';
 const fleetPrefix=location.pathname.match(/^\/r\/[a-f0-9]{16}/)?.[0]||'';
-const fleetSession=fleetPrefix?fetch('/api/user/bootstrap').then(r=>r.json()):Promise.resolve({});
-let connectionReady=false, connectionId=null, verifiedSignature='', checkEpoch=0, checkPending=false, jobBusy=false;
+let fleetRunnerIdentity=null;
+function runnerIdentityFromBootstrap(session,prefix){
+ const id=prefix.match(/^\/r\/([a-f0-9]{16})$/)?.[1];
+ const runner=session.runners?.find(r=>r.id===id),profile=session.profiles?.find(p=>p.id===runner?.spec.profile_id);
+ return profile?.host?{host:profile.host,port:runner.spec.port}:null;
+}
+const fleetSession=fleetPrefix?fetch('/api/user/bootstrap').then(r=>r.json()).then(session=>{fleetRunnerIdentity=runnerIdentityFromBootstrap(session,fleetPrefix);return session}):Promise.resolve({});
+let connectionReady=false, connectionId=null, verifiedSignature='', checkEpoch=0, checkPending=false, jobBusy=false, datasetBusy=false;
 const DATASET_API={'GSM8K':'GSM8K','GPQA Diamond':'GPQA','GPQA':'GPQA','AIME2026':'AIME2026'};
 const REAL_DATASETS=[
  {name:'GSM8K',task:'gsm8k_gen',size:1319,kind:'数学推理 · 公开',state:'unchecked'},
@@ -12,11 +18,12 @@ const REAL_DATASETS=[
 ];
 function serviceValues(){return {host:$('host').value.trim(),port:+$('port').value,model:$('model').value.trim(),tokenizer_path:$('path').value.trim()}}
 function signature(s){return JSON.stringify([s.host,s.port,s.model,s.tokenizer_path])}
+function connectionFailureMessage(error){const message=error?.message||String(error);return message.startsWith('tokenizer 路径不存在')?message+'；检查你的权重路径是否放在 /mnt 下':message}
 function applyDefaultLimit(){if(mode==='accuracy'){const d=currentDataset();if(d&&d.size)$('limit').value=d.size}else if(mode==='performance'){$('limit').value=$('requests').value}}
 $('requests').addEventListener('input',()=>{if(mode==='performance')$('limit').value=$('requests').value});
-async function runnerAPI(path,body){
+async function runnerAPI(path,body,options={}){
  const session=await fleetSession;
- const r=await fetch(fleetPrefix+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json',...(fleetPrefix?{'X-CSRF-Token':session.csrf}:{})},body:body===undefined?undefined:JSON.stringify(body)});
+ const r=await fetch(fleetPrefix+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json',...(fleetPrefix?{'X-CSRF-Token':session.csrf}:{})},body:body===undefined?undefined:JSON.stringify(body),signal:options.signal});
  const v=await r.json();
  if(!r.ok){const e=new Error(v.error||r.statusText);e.status=r.status;e.connectionVerified=v.connection_verified;throw e}
  return v;
@@ -36,6 +43,9 @@ function setRealLabels(){
  const lightOpt=$('engine').querySelector('option[value="light"]');if(lightOpt)lightOpt.remove();
  const limitLabel=$('limit').closest('label');limitLabel.firstChild.textContent=mode==='performance'?'样本数（默认=请求数量）':'样本数（默认=数据集全量）';$('limit').min=mode==='accuracy'?'1':'0';
  $('warmupEnabled').closest('.switchrow').style.display='';
+ $('warmupHint').textContent='预热数量可填 0–正式样本总数；默认输出上限与最大输出一致，可单独修改。预热重放数据集前 N 条，请求输入长度与正式数据一致；预热不计入正式统计。共享前缀预热只建立缓存，不保证服务端缓存持续命中。';$('warmups').min=0;
+ for(const id of ['maxout','warmupOutput','inputTokens'])$(id).max=225280;
+ $('inputTokens').min=64;$('batch').max=64000;$('requests').max=10000;$('limit').max=10000;$('ratio').max=100;
  $('stop').textContent='停止任务';$('downloadResult').textContent='↓ 导出测试记录';
  document.querySelector('#history .muted').textContent='配置、实际命令、日志与结果保存在服务器';
  document.querySelector('#results .badge').style.display='none';
@@ -45,40 +55,70 @@ function setRealLabels(){
  if(!realRecord){$('runTitle').textContent='等待测试';$('runDesc').textContent='连接验证后可提交任务';$('validation').textContent='等待结果…'}
 }
 function applyGate(){
- const locked=!runnerConnected||!connectionReady||jobBusy||(fleetPrefix&&!window.fleetSelectionReady);
- if(fleetPrefix)window.dispatchEvent(new CustomEvent('fleet-job-state',{detail:{busy:jobBusy}}));
+ const locked=!runnerConnected||!connectionReady||jobBusy||datasetBusy||(fleetPrefix&&!window.fleetSelectionReady);
+ if(fleetPrefix)window.dispatchEvent(new CustomEvent('fleet-job-state',{detail:{busy:jobBusy||datasetBusy}}));
  for(const id of ['datasetFields','parameterFields','summaryFields'])if($(id))$(id).disabled=locked;
  $('run').disabled=locked;$('export').disabled=locked;$('reset').disabled=locked;
  $('datasetPanel').classList.toggle('gated',!connectionReady);$('parametersPanel')?.classList.toggle('gated',!connectionReady);
  $('datasetGate').hidden=connectionReady;
- for(const id of ['host','port','model','path'])$(id).disabled=jobBusy;
- $('connect').disabled=jobBusy||checkPending;$('runnerSettings').disabled=jobBusy||checkPending;
- $('readyText').textContent=jobBusy?'任务正在运行':connectionReady?'服务连接已验证，可以执行测试':'请先通过服务连接检查';
+ for(const id of ['host','port','model','path'])$(id).disabled=jobBusy||datasetBusy;
+ $('connect').disabled=jobBusy||datasetBusy||checkPending;$('runnerSettings').disabled=jobBusy||datasetBusy||checkPending;
+ $('readyText').textContent=datasetBusy?'性能数据集正在生成，请等待完成':jobBusy?'任务正在运行':connectionReady?'服务连接已验证，可以执行测试':'请先通过服务连接检查';
  setRealLabels();
 }
 function handleError(e){if(e.connectionVerified===false||e.status===401){connectionReady=false;connectionId=null;verifiedSignature='';applyGate()}toast(e.message)}
 function realArtifacts(parent,r){
- parent.replaceChildren();
- if(r.artifacts){for(const f of r.artifacts.files)preBlock(parent,f.name,f.content,f.name);preBlock(parent,'实际 AISBench 执行命令',r.command||r.artifacts.aisbench_commands.join('\n'),'command.txt')}
+ if(parent.dataset.artifactJob!==r.id){parent.replaceChildren();parent.dataset.artifactJob=r.id}
+ const entries=[];
+ if(r.artifacts){const names=new Map();for(const f of r.artifacts.files||[]){const n=names.get(f.name)||0;names.set(f.name,n+1);entries.push({key:'file:'+f.name+':'+n,title:f.name,text:f.content,filename:f.name})}entries.push({key:'command',title:'实际 AISBench 执行命令',text:r.command||(r.artifacts.aisbench_commands||[]).join('\n'),filename:'command.txt'})}
  const archDir=`${runnerInfo.root}/results/jobs/${r.id}`;
  const arch=r.result_files?.length?`${archDir}\n\n原始文件:\n${r.result_files.join('\n')}`:archDir;
- preBlock(parent,'文件归档路径',arch,'archive.txt');
- preBlock(parent,'结果及原始文件索引',JSON.stringify({id:r.id,status:r.status,exit_code:r.exit_code,error:r.error,metrics:r.metrics,raw_tables:r.raw_tables,result_files:r.result_files},null,2),'result.json');
+ entries.push({key:'archive',title:'文件归档路径',text:arch,filename:'archive.txt'});
+ entries.push({key:'result',title:'结果及原始文件索引',text:JSON.stringify({id:r.id,status:r.status,exit_code:r.exit_code,error:r.error,metrics:r.metrics,raw_tables:r.raw_tables,result_files:r.result_files},null,2),filename:'result.json'});
+ const existing=new Map([...parent.children].map(node=>[node.dataset.artifactKey,node]));
+ for(const [index,entry] of entries.entries()){
+  let node=existing.get(entry.key);
+  if(!node){const holder=document.createElement('div');preBlock(holder,entry.title,entry.text,entry.filename);node=holder.firstElementChild;node.dataset.artifactKey=entry.key}
+  const pre=node.querySelector('pre');if(pre.textContent!==entry.text){const top=pre.scrollTop,left=pre.scrollLeft;pre.textContent=entry.text;pre.scrollTop=top;pre.scrollLeft=left}
+  node.querySelector('.artifactdownload').onclick=()=>downloadText(entry.filename,entry.text);
+  if(parent.children[index]!==node)parent.insertBefore(node,parent.children[index]||null);
+  existing.delete(entry.key);
+ }
+ for(const node of existing.values())node.remove();
 }
 function _w(s){let w=0;for(const ch of s){const c=ch.codePointAt(0);w+=(c>=0x1100&&(c<=0x115f||c===0x2329||c===0x232a||(c>=0x2e80&&c<=0xa4cf&&c!==0x303f)||(c>=0xac00&&c<=0xd7a3)||(c>=0xfe10&&c<=0xfe19)||(c>=0xfe30&&c<=0xfe6f)||(c>=0xff00&&c<=0xff60)||(c>=0xffe0&&c<=0xffe6)||(c>=0x20000&&c<=0x3fffd)))?2:1}return w}
 function _kv(label,value){return '  '+label+' '.repeat(Math.max(1,12-_w(label)))+String(value)}
 function _fmtTime(v){if(!v)return '-';try{return new Date(v).toLocaleString('zh-CN',{hour12:false})}catch(e){return String(v)}}
-// 成功：从最后一个进度 100% 起；失败/停止/中断：完整日志
-function _tailLog(r){const log=r.log||'';if(r.status!=='completed')return log;const cut=i=>{const s=Math.max(log.lastIndexOf('\n',i),log.lastIndexOf('\r',i));return log.slice(s+1)};const i=log.lastIndexOf('100%');if(i>=0)return cut(i);for(const m of ['Inference tasks completed','Summarizing']){const j=log.lastIndexOf(m);if(j>=0)return cut(j)}return log}
+function splitNativeTerminal(log){
+ const begin='[Runner terminal frame begin]\n',end='\n[Runner terminal frame end]';let cursor=0,plain='',frame=null;
+ const firstBegin=log.indexOf(begin),firstEnd=log.indexOf(end);
+ if(firstEnd>=0&&(firstBegin<0||firstEnd<firstBegin))cursor=firstEnd+end.length;
+ while(true){const start=log.indexOf(begin,cursor);if(start<0){plain+=log.slice(cursor);break}plain+=log.slice(cursor,start);const finish=log.indexOf(end,start+begin.length);if(finish<0)break;frame=log.slice(start+begin.length,finish);cursor=finish+end.length}
+ return {log:plain,frame};
+}
+function executionLogText(log){
+ const begin='[Runner terminal frame begin]\n',end='\n[Runner terminal frame end]';
+ const firstBegin=log.indexOf(begin),firstEnd=log.indexOf(end);
+ if(firstEnd>=0&&(firstBegin<0||firstEnd<firstBegin))log=log.slice(firstEnd+end.length);
+ log=log.replace(/\[Runner terminal frame begin\]\n([\s\S]*?)\n\[Runner terminal frame end\]/g,'$1');
+ const partial=log.indexOf(begin);if(partial>=0)log=log.slice(0,partial);
+ log=log.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,'').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\x1b[()][0-2A-Z]/g,'').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g,'').replace(/\r\n?/g,'\n');
+ const output=[],audits=new Set();let previous='';const progress=line=>/^(?:Warmup:|Progress:|Calculating performance details:|POST=)/.test(line);
+ for(const raw of log.split('\n')){const line=raw.replace(/[ \t]+$/,'');if(!line){if(output.length&&output.at(-1)!==''&&!progress(previous))output.push('');continue}if(line.includes('Start warmup'))audits.clear();const audit=line.match(/(?:\[Runner\] Warmup max_out_len=.+|Warmup finished Total Count:\s*\d+ Success Count:\s*\d+ Failed Count:\s*\d+)$/)?.[0];if(audit){if(audits.has(audit)&&(line.startsWith('[Runner] Warmup max_out_len=')||line.startsWith('Warmup finished Total Count:')))continue;audits.add(audit)}if(progress(line)&&line===previous)continue;output.push(line);previous=line}
+ return output.join('\n').trim();
+}
+function _tailLog(r){return executionLogText(r.log||'')}
 function recordText(r){
  const c=r.config||{},acc=c.mode==='accuracy';
  const L=['='.repeat(64),'  Ascend Bench · 测试记录','='.repeat(64)];
  L.push(_kv('任务 ID',r.id||''), _kv('测试类型',acc?'精度测试（AISBench）':'性能测试（AISBench）'));
+ if(fleetRunnerIdentity)L.push(_kv('Runner 地址',`${fleetRunnerIdentity.host}:${fleetRunnerIdentity.port}`));
  L.push(_kv('状态',({running:'执行中',completed:'已完成',stopped:'已停止',interrupted:'已中断'})[r.status]||r.status||''));
  if(r.created_at)L.push(_kv('开始时间',_fmtTime(r.created_at)));
  if(r.completed_at)L.push(_kv('完成时间',_fmtTime(r.completed_at)));
  L.push(_kv('退出码',r.exit_code==null?'-':r.exit_code), _kv('失败请求',r.failed_requests==null?'-':r.failed_requests));
  if(r.error)L.push(_kv('错误',r.error));
+ for(const notice of r.notices||[])L.push(_kv('提示',notice));
  L.push('','-'.repeat(64),'  测试配置','-'.repeat(64));
  L.push('【推理服务】',_kv('服务地址',`${c.host||''}:${c.port||''}`),_kv('模型名称',c.model||''),_kv('tokenizer',c.tokenizer_path||''),'');
  if(acc){
@@ -88,23 +128,35 @@ function recordText(r){
   L.push('【负载规格】',_kv('输入长度',`${wl.input_tokens} tokens`),_kv('请求数量',wl.count),_kv('随机种子',wl.seed),_kv('共享前缀',pr>0?`启用 · ${Math.round(pr*100)}%`:'未启用'));
  }
  const g=c.generation_kwargs||{},wm=c.warmup||{};
- L.push('','【生成参数】',_kv('最大输出',`max_out_len = ${c.max_out_len}`),_kv('并发请求',`batch_size  = ${c.batch_size}`),_kv('温度',`temperature = ${g.temperature}`),_kv('忽略结束符',`ignore_eos  = ${g.ignore_eos}`),_kv('流式响应',`stream = ${c.stream?'是':'否'}${acc?'':'（性能测试必须）'}`),_kv('超时 / 重试',`${c.timeout} 秒 / ${c.retry} 次`),_kv('运行模式',c.execution?.mode||''));
+ L.push('','【生成参数】',_kv('最大输出',`max_out_len = ${c.max_out_len}`),_kv('并发请求',`batch_size  = ${c.batch_size}`),_kv('温度',`temperature = ${g.temperature}`),_kv('忽略结束符',`ignore_eos  = ${g.ignore_eos}`),_kv('流式响应',`stream = ${c.stream?'是':'否'}${acc?'':'（性能测试必须）'}`),_kv('超时 / retry',`${c.timeout==null?'AISBench 原生配置（不限时）':c.timeout+' 秒'} / ${c.retry}`),_kv('运行模式',c.execution?.mode||''));
  L.push('','【预热】',_kv('启用',wm.enabled?`是 · ${wm.count} 条 · 输出上限 ${wm.max_out_len}`:'否'));
- L.push('','-'.repeat(64),'  执行日志'+(r.status==='completed'?'（自进度 100% 起）':'（完整）'),'-'.repeat(64));
+ L.push('','-'.repeat(64),'  执行日志（完整）','-'.repeat(64));
  L.push((_tailLog(r)||'(无日志)').replace(/\r\n/g,'\n').replace(/\r/g,'\n'));
  L.push('='.repeat(64));
  return L.join('\n')+'\n';
 }
 function exportRecord(r){if(r)downloadText((r.id||'record')+'-record.log',recordText(r),'text/plain;charset=utf-8')}
+function executionEndpointText(r){
+ const runner=fleetRunnerIdentity?`${fleetRunnerIdentity.host}:${fleetRunnerIdentity.port}`:'未提供主机地址';
+ const service=r.config?.host?`${r.config.host}:${r.config.port}`:'未提供';
+ return `Runner：${runner} · 模型服务：${service}`;
+}
+function showExecutionEndpoints(r){
+ let info=$('executionRunnerInfo');
+ if(!info){info=document.createElement('p');info.id='executionRunnerInfo';info.className='hint';$('runDesc').after(info)}
+ const text=executionEndpointText(r);if(info.textContent!==text)info.textContent=text;
+}
 function realResult(r){
  realRecord=r;report=r;$('results').hidden=false;$('editor').hidden=true;$('metrics').innerHTML='';$('detailResults').innerHTML='';
- const accuracy=r.config.mode==='accuracy';$('metrics').classList.toggle('accuracyMetric',accuracy);$('logs').textContent=r.log||'';
+ const accuracy=r.config.mode==='accuracy';$('metrics').classList.toggle('accuracyMetric',accuracy);$('logs').textContent=executionLogText(r.log||'');$('nativeTerminalPanel')?.remove();
  $('runTitle').textContent=r.status==='running'?'测试执行中':r.status==='completed'?'测试完成':r.status==='stopped'?'任务已停止':'测试未通过';
  $('runDesc').textContent=r.error||`任务 ${r.id} · 归档目录 ${runnerInfo.root}/results/jobs/${r.id}`;
+ showExecutionEndpoints(r);
  $('results').querySelector('.resultgrid').hidden=false;$('stop').hidden=r.status!=='running';$('downloadResult').hidden=r.status==='running';$('progressBar').style.width=r.status==='running'?'45%':'100%';
  if(r.metrics?.accuracy){const a=r.metrics.accuracy;$('metrics').innerHTML=`<div class="metric"><span>${escapeHtml(r.config.dataset?.name||'数据集')} ·  Accuracy</span><b>${escapeHtml(a.score_percent)}%</b><small>正确 ${a.correct===null?'待核对':escapeHtml(a.correct)} / ${escapeHtml(a.total)}</small></div>`}
  if(!accuracy)for(const t of r.raw_tables||[]){const title=document.createElement('div');title.className='sectionlabel';title.textContent=t.file;const div=document.createElement('div');div.innerHTML=table(t.headers,t.rows);$('detailResults').append(title,div)}
  $('validation').textContent=r.status==='completed'?`AISBench 退出码 ${r.exit_code}，原始结果已归档。`:'请结合完整日志检查实际状态。';
+ if(r.notices?.length)$('validation').textContent+='\n提示：'+r.notices.join('\n');
  realArtifacts($('executionArtifacts'),r);setRealLabels();
 }
 async function loadRealHistory(){
@@ -113,17 +165,40 @@ async function loadRealHistory(){
  for(const r of rows){const item=document.createElement('details');item.className='historyitem';const summary=document.createElement('summary');summary.textContent=` · ${r.config.mode==='accuracy'?'精度':'性能'} · ${r.config.dataset?.name||'合成负载'} · ${r.created_at} · ${r.status}`;item.append(summary);const button=document.createElement('button');button.className='secondary';button.textContent='↓ 导出测试记录';button.onclick=()=>exportRecord(r);item.append(button);const body=document.createElement('div');realArtifacts(body,r);item.append(body);$('historyList').append(item)}
 }
 const previousRealSwitch=switchMode;
-switchMode=function(next){if(timer)return toast('请等待任务完成或先停止当前任务');previousRealSwitch(next);if(!runnerConnected)return;$('engine').value='aisbench';$('engine').dispatchEvent(new Event('change'));if(next==='history')loadRealHistory().catch(handleError);else{applyDefaultLimit();sync()}applyGate()};
+switchMode=function(next){if(datasetBusy)return toast('数据集正在生成，请完成后再切换评测页面');if(timer)return toast('请等待任务完成或先停止当前任务');previousRealSwitch(next);if(!runnerConnected)return;$('engine').value='aisbench';$('engine').dispatchEvent(new Event('change'));if(next==='history')loadRealHistory().catch(handleError);else{applyDefaultLimit();sync()}applyGate()};
+let jobPollEpoch=0,pollCurrentJob=null;
+function startJobPolling(jobId){
+ const epoch=++jobPollEpoch;let pending=false;
+ if(timer)clearInterval(timer);
+ async function poll(){
+  if(pending||epoch!==jobPollEpoch)return;
+  pending=true;const controller=new AbortController(),deadline=setTimeout(()=>controller.abort(),20000);
+  try{
+   const current=await runnerAPI('/api/jobs/'+jobId,undefined,{signal:controller.signal});
+   if(epoch!==jobPollEpoch)return;
+   realResult(current);
+   if(current.status!=='running'){
+    clearInterval(timer);timer=null;pollCurrentJob=null;jobBusy=false;applyGate();
+    loadRealHistory().catch(()=>toast('任务已结束，历史列表暂未刷新，可稍后重新查看'));
+   }
+  }catch(e){
+   if(epoch===jobPollEpoch)$('validation').textContent='任务状态暂时无法刷新，将自动重试；未停止服务器任务。'+(e.name==='AbortError'?'状态请求超时。':e.message||'');
+  }finally{clearTimeout(deadline);pending=false}
+ }
+ pollCurrentJob=poll;timer=setInterval(()=>{void poll()},5000);
+}
+window.addEventListener('focus',()=>{void pollCurrentJob?.()});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)void pollCurrentJob?.()});
 $('run').onclick=async()=>{
  try{ensureVerified();const c=readConfig(true);if(fleetPrefix){c.execution.target={kind:'direct',container_name:null}}if(signature({host:c.host,port:c.port,model:c.model,tokenizer_path:c.tokenizer_path})!==verifiedSignature)throw Error('额外参数覆盖了已验证的服务信息，请直接修改服务面板并重新检查');jobBusy=true;applyGate();const r=await runnerAPI('/api/jobs',withConnection(c));realResult(r);
- timer=setInterval(async()=>{try{const current=await runnerAPI('/api/jobs/'+r.id);realResult(current);if(current.status!=='running'){clearInterval(timer);timer=null;jobBusy=false;applyGate();await loadRealHistory()}}catch(e){clearInterval(timer);timer=null;jobBusy=false;applyGate();handleError(e)}},1500);
+ startJobPolling(r.id);
  }catch(e){jobBusy=false;applyGate();handleError(e)}
 };
 $('stop').onclick=async()=>{if(!realRecord)return;try{await runnerAPI('/api/jobs/'+realRecord.id+'/stop',{});toast('已发送停止请求，等待保存日志')}catch(e){handleError(e)}};
 $('connect').onclick=async()=>{
  const epoch=++checkEpoch;const service=serviceValues();connectionReady=false;connectionId=null;verifiedSignature='';checkPending=true;applyGate();$('connectionStatus').textContent='正在验证 /health、模型名称与 tokenizer 路径…';
  try{const v=await runnerAPI('/api/check-service',{service});if(epoch!==checkEpoch)return;connectionId=v.connection_id;verifiedSignature=signature(service);connectionReady=true;$('connectionStatus').textContent='✓ 连接已验证并保存：'+v.data.map(m=>m.id).join(', ');await refreshDatasetState()}
- catch(e){if(epoch===checkEpoch){connectionReady=false;$('connectionStatus').textContent='连接失败：'+e.message}}
+ catch(e){if(epoch===checkEpoch){connectionReady=false;$('connectionStatus').textContent='连接失败：'+connectionFailureMessage(e)}}
  finally{checkPending=false;applyGate()}
 };
 const originalPreparation=renderPreparation;
@@ -139,10 +214,42 @@ async function refreshDatasetState(){
  }catch(e){$('datasetStatus').textContent=e.message;handleError(e)}
 }
 $('prepare').onclick=async()=>{try{ensureVerified();const api=DATASET_API[currentDataset().name];if(!api)throw Error('该数据集尚未适配');$('prepare').disabled=true;$('datasetStatus').textContent='Runner 正在校验 / 准备数据…';const r=await runnerAPI('/api/datasets/prepare',withConnection({name:api}));await refreshDatasetState();toast('数据就绪：'+r.path)}catch(e){$('datasetStatus').textContent=e.message;handleError(e)}finally{$('prepare').disabled=false;applyGate()}};
-$('generate').onclick=async()=>{try{ensureVerified();$('generate').disabled=true;$('generationStatus').textContent='正在精确分词生成并独立校验…';const r=await runnerAPI('/api/datasets/generate',withConnection({input_tokens:+$('inputTokens').value,seed:+$('seed').value,count:(+$('limit').value)||(+$('requests').value),max_out_len:+$('maxout').value,prefix_ratio:$('prefix').checked?+$('ratio').value/100:0}));$('generationStatus').textContent=(r.reused?'已校验并复用：':'已生成并校验：')+r.path}catch(e){$('generationStatus').textContent=e.message;handleError(e)}finally{$('generate').disabled=false;applyGate()}};
+let generationWake=null;
+function generationDelay(){return new Promise(resolve=>{let timer;const finish=()=>{clearTimeout(timer);if(generationWake===finish)generationWake=null;resolve()};generationWake=finish;timer=setTimeout(finish,2000)})}
+async function waitForDatasetGeneration(body,onProgress){
+ for(;;){
+  const controller=new AbortController(),deadline=setTimeout(()=>controller.abort(),20000);
+  try{
+   const result=await runnerAPI('/api/datasets/generate',body,{signal:controller.signal});
+   if(result.state!=='preparing')return result;
+   onProgress(result,null);
+  }catch(error){
+   if(error.status&&!([408,429,500,502,503,504].includes(error.status)))throw error;
+   onProgress(null,error);
+  }finally{clearTimeout(deadline)}
+  await generationDelay();
+ }
+}
+window.addEventListener('focus',()=>generationWake?.());
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)generationWake?.()});
+$('generate').onclick=async()=>{
+ if(datasetBusy)return;
+ try{
+  ensureVerified();const c=readConfig();
+  if(signature({host:c.host,port:c.port,model:c.model,tokenizer_path:c.tokenizer_path})!==verifiedSignature)throw Error('服务信息已变化，请先重新检查连接');
+  datasetBusy=true;applyGate();$('generate').disabled=true;$('generationStatus').textContent='后台准备数据集…';
+  const body=withConnection({generation_id:crypto.randomUUID(),endpoint:c.api.endpoint,trust_remote_code:c.api.trust_remote_code,input_tokens:c.workload.input_tokens,seed:c.workload.seed,count:c.workload.count,max_out_len:c.max_out_len,prefix_ratio:c.workload.prefix_ratio}),started=Date.now();
+  const r=await waitForDatasetGeneration(body,(result,error)=>{
+   if(error){$('generationStatus').textContent='连接暂时无法确认，正在自动重试查询生成进度；后台任务未取消。';return}
+   const p=result.progress||{};$('generationStatus').textContent=`后台${p.phase||'准备中'}：${p.completed||0}/${p.total||body.count}，已等待 ${Math.floor((Date.now()-started)/1000)} 秒；Runner 连接正常`;
+  });
+  $('generationStatus').textContent=(r.reused?'已校验并复用：':'已生成并校验：')+r.path;
+ }catch(e){$('generationStatus').textContent=e.message;handleError(e)}
+ finally{generationWake=null;datasetBusy=false;$('generate').disabled=false;applyGate()}
+};
 $('downloadResult').onclick=()=>{if(realRecord)exportRecord(realRecord)};
 $('back').onclick=()=>{if(timer)return toast('请先停止任务');$('results').hidden=true;$('editor').hidden=false;applyGate()};
-$('reset').onclick=()=>{switchMode(mode);$('batch').value=1;$('timeout').value=600;$('retry').value=2;$('limit').value=mode==='accuracy'?(currentDataset()?.size||1):+$('requests').value;$('warmupEnabled').checked=false;$('warmupFields').hidden=true;$('pressure').checked=false;$('pressureDuration').hidden=true;$('extraParams').value='';validateExtras();sync();applyGate();toast('已恢复默认参数')};
+$('reset').onclick=()=>{switchMode(mode);$('batch').value=1;$('timeout').value=600;resetRequestTimeout();$('retry').value=2;$('limit').value=mode==='accuracy'?(currentDataset()?.size||1):+$('requests').value;$('warmupEnabled').checked=false;$('warmupFields').hidden=true;$('pressure').checked=false;$('pressureDuration').hidden=true;$('extraParams').value='';validateExtras();sync();applyGate();toast('已恢复默认参数')};
 $('export').onclick=()=>{try{ensureVerified();download('test-config.json',readConfig(false))}catch(e){handleError(e)}};
 async function activateRunner(){
  if(fleetPrefix){await window.fleetReady;if(!window.fleetSelectionReady)return}

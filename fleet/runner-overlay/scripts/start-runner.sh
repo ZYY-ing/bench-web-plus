@@ -11,12 +11,17 @@ cd "$BASE"
 mkdir -p logs tmp cache
 export ASCEND_BENCH_HOME="$BASE" HOME="$BASE" TMPDIR="$BASE/tmp" XDG_CACHE_HOME="$BASE/cache" PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$BASE/scripts${PYTHONPATH:+:$PYTHONPATH}"
+export ASCEND_BENCH_PROCESS_ROLE=runner
+export ASCEND_BENCH_API_ONLY=1
+# The Runner tokenizes prompts and calls HTTP APIs; it does not initialize NPU
+# devices. Match the AISBench child environment before any Python import.
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 # Runner 与测试请求全部直连本机/内网服务，不走企业代理（否则 504 HIS Proxy Notification）
 export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
 export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 
 # 探测可达的服务 IP（用于隧道提示；容器 host 网络时 127.0.0.1 即宿主机回环）
-HOST_IP="$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("8.8.8.8",80));print(s.getsockname()[0])' 2>/dev/null || hostname -I | awk '{print $1}')"
+HOST_IP="$(python3 -I -S -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(("8.8.8.8",80));print(s.getsockname()[0])' 2>/dev/null || hostname -I | awk '{print $1}')"
 
 if [ "${ASCEND_BENCH_MANAGED:-0}" = 1 ]; then
   echo "正在启动 Runner；中心将自动核对身份并接入，无需手工建隧道。"
@@ -40,10 +45,9 @@ cat <<EOF
 EOF
 fi
 
-nohup python3 scripts/runner.py < /dev/null >> logs/runner.log 2>&1 &
-sleep 2
-if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
-  echo "Runner 健康检查通过（http://127.0.0.1:$PORT/）"
-else
-  echo "Runner 未就绪（可能仍在启动），查看日志: docker exec $CONTAINER tail -20 $BASE/logs/runner.log" >&2
-fi
+# All installers/recovery launch this script through docker exec -d. Keep the
+# Python service as that exec's main process instead of orphaning a nohup child.
+# The caller performs the bounded health/identity checks independently.
+printf '%s\n' "$$" > runner.starting.pid
+PYTHON_BIN="$(python3 -I -S -c 'import sys; print(sys.executable)')"
+exec "$PYTHON_BIN" -I -S scripts/runtime_compat.py "$PYTHON_BIN" -u scripts/runner.py < /dev/null >> logs/runner.log 2>&1

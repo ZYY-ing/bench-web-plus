@@ -18,9 +18,14 @@ HERE = Path(__file__).parent
 
 
 def validate_install_network(body):
-    if not isinstance(body, dict) or set(body) - {'proxy', 'pip_index', 'extra_hosts'}:
+    if not isinstance(body, dict) or set(body) - {'proxy', 'pip_index', 'extra_hosts', 'pip_cert'}:
         raise ValueError('安装网络配置无效')
     result = {}
+    certificate=str(body.get('pip_cert','')).strip()
+    if certificate:
+        if len(certificate)>2048 or not certificate.startswith(('/mnt/','/home/')) or not re.fullmatch(r'/[a-zA-Z0-9_./-]+',certificate) or '..' in certificate.split('/') or certificate.endswith('/'):
+            raise ValueError('包源 CA 证书请填写容器可见的 /mnt 或 /home 下绝对文件路径')
+        result['pip_cert']=certificate
     for key in ('proxy', 'pip_index'):
         value = str(body.get(key, '')).strip()
         if not value:
@@ -98,6 +103,12 @@ def load_profiles(path, tool_only=False):
         if index and (not index.startswith('https://') or any(c.isspace() for c in index)):
             raise ValueError('pip_index 必须为 HTTPS URL')
     return profiles
+
+
+class AccessPendingError(RuntimeError):
+    def __init__(self, message, runner):
+        super().__init__(message)
+        self.runner = runner
 
 
 class Transport:
@@ -199,6 +210,18 @@ class Transport:
             raise ValueError('会话已断开，请在网页重新连接机器；不会保存密码')
         return session
 
+    def session_connected(self, profile_id):
+        session = self.sessions.get(profile_id)
+        if not session:
+            return False
+        if hasattr(type(session), 'connected'):
+            return session.connected()
+        try:
+            transport = session.client.get_transport()
+            return bool(transport and transport.is_active() and transport.is_authenticated())
+        except Exception:
+            return False
+
     def deploy(self, spec, archive, log, step):
         p = self.profiles[spec['profile_id']]
         if p.get('mode') == 'session':
@@ -211,12 +234,22 @@ class Transport:
             payload = {'spec': spec, 'archive': path, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
                        'runner_sha256': hashlib.sha256(runner_source).hexdigest(), 'pip_index': p.get('pip_index')}
             payload['network'] = validate_install_network(spec.get('network', {}))
+            from .pip_trust import REMOTE, trust_payload
+            payload['pip_trust']=trust_payload(payload['network'])
             with tarfile.open(archive) as package:
                 payload['release'] = json.load(package.extractfile('ascend-bench-kit/fleet-release.json'))
-            script = self.helper + '\n' + (HERE / 'direct_worker.py').read_text(encoding='utf-8') + '\ndirect_main(json.loads(' + repr(json.dumps(payload)) + '))\n'
+            script = self.helper + '\n' + REMOTE + '\n' + (HERE / 'replacement.py').read_text(encoding='utf-8') + '\n' + (HERE / 'direct_worker.py').read_text(encoding='utf-8') + '\ndirect_main(json.loads(' + repr(json.dumps(payload)) + '))\n'
             session.execute(script, timeout=2700, log=log)
+            spec = {k:v for k,v in spec.items() if not k.startswith('_')}
             if spec.get('durable'):
-                self.channels.install(session, spec, p, log)
+                helper = (HERE / 'remote_helper.py').read_text(encoding='utf-8')
+                check = helper + '\nprint(json.dumps(read_status(json.loads(' + repr(json.dumps(spec)) + '))["status"]))\n'
+                verified = {'status': json.loads(session.execute(check, timeout=45)), 'token': ''}
+                step('connecting', 'Runner 已就绪，正在迁移或核对受限持久连接')
+                try:
+                    self.channels.install(session, spec, p, log)
+                except Exception as exc:
+                    raise AccessPendingError(str(exc), verified) from None
             step('health', '核对 Runner 身份、版本、健康和空闲状态')
             return self.status(spec)
         if p.get('mode') in ('restricted', 'session'):
@@ -275,6 +308,8 @@ class Transport:
             raise RuntimeError('SSH 隧道启动超时')
 
     def close(self):
+        if getattr(self, 'authorizations', None):
+            self.authorizations.close()
         for session in self.sessions.values():
             session.close()
         for process, _ in self.tunnels.values():

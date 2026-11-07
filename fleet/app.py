@@ -1,11 +1,13 @@
 """Local-only v1 console. Python 3.12+, no third-party dependencies."""
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import ipaddress
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 from pathlib import Path
 import re
 import secrets
@@ -13,15 +15,18 @@ import sqlite3
 import ssl
 import threading
 import time
+import traceback
 from urllib.parse import urlsplit
 import urllib.error
 import urllib.request
 import uuid
 
-from .transport import Transport, load_profiles, validate_spec, validate_install_network
+from .transport import Transport, AccessPendingError, load_profiles, validate_spec, validate_install_network
 from . import bootstrap
 from .accounts import Accounts
 from .persistent import Channels
+from .gateway import validate_service_endpoint
+from .dataset_request import confirm_generation
 from .http_server import BoundedServer
 from .session_ssh import SessionSSH, RemoteCommandError, probe, validate_endpoint, INSPECT_SCRIPT
 
@@ -87,6 +92,15 @@ class Store:
             row = self.db.execute('SELECT job FROM claims WHERE resource=?', ('runner:' + runner,)).fetchone()
         return row[0] if row else None
 
+    def conflict_info(self, runner, target):
+        with self.lock:
+            row = self.db.execute('SELECT runner,job FROM claims WHERE resource IN (?,?) ORDER BY CASE WHEN resource=? THEN 0 ELSE 1 END LIMIT 1',
+                                  ('runner:'+runner, 'target:'+target, 'runner:'+runner)).fetchone()
+            if not row:
+                return None
+            resource = self.db.execute("SELECT resource FROM claims WHERE runner=? AND job=? AND resource LIKE 'target:%' LIMIT 1", row).fetchone()
+            return {'runner': row[0], 'request': row[1], 'target': resource[0][7:] if resource else target}
+
     def release(self, runner, request_id):
         with self.lock, self.db:
             self.db.execute('DELETE FROM claims WHERE runner=? AND job=?', (runner, request_id))
@@ -107,6 +121,9 @@ class Console:
             'runner_ports': [18787, 18788], 'ais_paths': []}]
         self.transport = Transport(self.profiles)
         self.transport.channels = Channels(directory)
+        from .managed_ssh import Authorizations
+        self.transport.authorizations = Authorizations(directory)
+        self.transport.authorizations.restore(self.profiles, self.transport.sessions)
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.mutex = threading.RLock()
         self.archive = archive or ROOT / 'dist/ascend-bench-fleet-kit.tar.gz'
@@ -122,6 +139,10 @@ class Console:
         self.refresh_locks = {}
         self.refresh_times = {}
         self.refresh_versions = {}
+        self.refresh_samples = {}
+        self.refresh_durations = {}
+        from .storage_cleanup import StorageCleanup
+        self.storage_cleanup = StorageCleanup(self)
         if demo and not self.store.list('runner'):
             spec = {'profile_id': 'demo-1', 'container': 'ascend-test', 'base': '/home/benchops/ascend-bench', 'port': 18787, 'ais_path': ''}
             rid = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
@@ -130,7 +151,10 @@ class Console:
 
     def public_profiles(self):
         return [{**{k: p[k] for k in ('id', 'name', 'host', 'containers', 'base_roots', 'runner_ports', 'ais_paths', 'mode', 'user', 'ssh_port') if k in p},
-                 'connected': p.get('mode') != 'session' or p['id'] in self.transport.sessions} for p in self.profiles]
+                 'auto_manage': p.get('auto_manage', False),
+                 'management_blocked': getattr(self.transport.sessions.get(p['id']), 'blocked', False),
+                 'management_error': getattr(self.transport.sessions.get(p['id']), 'last_error', '') or p.get('management_error', ''),
+                 'connected': p.get('mode') != 'session' or self.transport.session_connected(p['id'])} for p in self.profiles]
 
     def probe_machine(self, body):
         host, port = validate_endpoint(body)
@@ -175,6 +199,15 @@ class Console:
                    'ssh_port': port, 'mode': 'session', 'containers': [c['name'] for c in inventory['containers']],
                    'base_roots': ['/home', '/mnt'], 'runner_ports': [18787], 'ais_paths': [],
                    'service_hosts': [host, '127.0.0.1', 'localhost'], 'tokenizer_roots': ['/models', '/mnt', '/home']}
+        if body.get('auto_manage') is True:
+            try:
+                managed = self.transport.authorizations.authorize(session, profile, fingerprint)
+            except Exception:
+                session.close()
+                raise
+            session.close()
+            session = managed
+            profile['auto_manage'] = True
         with self.mutex:
             old = self.transport.sessions.get(profile_id)
             if old:
@@ -191,6 +224,8 @@ class Console:
             finally:
                 temporary.unlink(missing_ok=True)
             self.store.save('hostkey', {'id': hashlib.sha256(f'{host}:{port}'.encode()).hexdigest(), 'host': host, 'port': port, 'fingerprint': fingerprint})
+        if profile.get('auto_manage'):
+            self.transport.authorizations.watch(profile_id, session)
         return {'profile_id': profile_id, 'inventory': inventory}
 
     def direct_spec(self, body, profile):
@@ -239,10 +274,10 @@ class Console:
         return inventory
 
     def annotate_inventory(self, profile_id, inventory):
-        known = {r['spec']['container'] for r in self.store.list('runner') + self.store.list('removed-runner') if r['spec']['profile_id'] == profile_id}
-        known.update(t['spec']['container'] for t in self.store.list('deployment') if t['spec']['profile_id'] == profile_id and t['state'] == 'ready')
+        known = {t['spec']['container'] for t in self.store.list('deployment') if t['spec']['profile_id'] == profile_id and t['state'] == 'ready'}
         for container in inventory['containers']:
-            container['known_runner'] = container['name'] in known or container.get('runner_installed', False)
+            container['installed_by_tool'] = container['name'] in known
+            container['known_runner'] = container['installed_by_tool']
         return inventory
 
     def enrollments(self):
@@ -318,24 +353,70 @@ class Console:
         task['logs'] = (task['logs'] + time.strftime('%H:%M:%S ') + message + '\n')[-40000:]
         self.store.save('deployment', task)
 
+    def runner_for_endpoint(self, spec):
+        matches = [r for r in self.store.list('runner') if all(r['spec'].get(k) == spec.get(k) for k in ('profile_id','base','port'))]
+        if len(matches) > 1:
+            raise ValueError('同一 Runner 地址存在多条登记，请先核对清单')
+        return matches[0] if matches else None
+
     def deploy(self, body):
         profile = next((p for p in self.profiles if p['id'] == body.get('profile_id')), None)
         spec = self.direct_spec(body, profile) if profile and profile.get('mode') == 'session' else validate_spec(body, self.profiles)
+        peers = [r for r in self.store.list('runner') if self.transport.profiles[r['spec']['profile_id']]['host'] == profile['host']]
+        selected = next((r for r in peers if all(r['spec'][k]==spec[k] for k in ('profile_id','base','port')) and r['spec']['container']!=spec['container']),None)
+        replace = selected is not None
+        if replace:
+            old = selected['spec']
+            if not self.demo:
+                if profile.get('mode') != 'session':raise ValueError('复用旧安装需要已授权的 SSH 管理连接')
+                helper=(ROOT/'fleet/remote_helper.py').read_text(encoding='utf-8')
+                proof=json.loads(self.transport.session(spec['profile_id']).execute(helper+'\nprint(json.dumps(retired_container(json.loads('+repr(json.dumps(old))+'))))\n',timeout=45))
+                if proof.get('retired') is not True:
+                    raise ValueError('旧容器仍在运行，可能有测试或其他服务；请手动停止专用旧容器后复用，或使用独立端口和目录新增')
+            if old.get('access_port', old['port'] + 1000) != spec.get('access_port', spec['port'] + 1000):
+                raise ValueError('复用旧安装时请沿用原受限连接端口')
+            spec['_replace'] = {k:v for k,v in old.items() if not k.startswith('_')}
+        for row in peers:
+            old = row['spec']
+            same = all(old[k] == spec[k] for k in ('profile_id','container','base','port'))
+            if same or replace and row['id'] == selected['id']:
+                continue
+            ports = {spec['port']} | ({spec.get('access_port',spec['port']+1000)} if spec.get('durable') else set())
+            old_ports = {old['port']} | ({old.get('access_port',old['port']+1000)} if old.get('durable') or self.transport.channels.has(old) else set())
+            overlap = lambda a,b: a == b or a.startswith(b.rstrip('/')+'/') or b.startswith(a.rstrip('/')+'/')
+            if ports & old_ports or overlap(spec['base'],old['base']) or (spec.get('container_mode') == 'new' and overlap(spec['host_path'],old.get('host_path') or old['base'])):
+                raise ValueError('保留旧 Runner 时，Runner/受限连接端口、安装目录及宿主机挂载目录必须独立；复用原端口和目录前请手动停止旧容器')
+        spec['_peers'] = [{k:v for k,v in r['spec'].items() if not k.startswith('_')} for r in peers if not (replace and r['id'] == selected['id']) and not all(r['spec'][k] == spec[k] for k in ('profile_id','container','base','port'))]
         identity = {k: spec[k] for k in ('profile_id', 'container', 'base', 'port', 'ais_path')}
         runner_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
-        previous = next((r for r in self.store.list('runner') + self.store.list('removed-runner') if all(r['spec'].get(k) == v for k, v in identity.items())), None)
+        previous = selected or self.runner_for_endpoint(spec) or next((r for r in self.store.list('removed-runner') if all(r['spec'].get(k) == v for k, v in identity.items())), None)
         if previous:
             runner_id = previous['id']
+        request_id = self.store.request_for(runner_id)
+        if request_id and previous and previous['spec']['container'] != spec['container']:
+            session = self.transport.session(spec['profile_id'])
+            helper = (ROOT/'fleet/remote_helper.py').read_text(encoding='utf-8')
+            check = helper + '\nprint(json.dumps(retired_container(json.loads(' + repr(json.dumps(previous['spec'])) + '))))\n'
+            proof = json.loads(session.execute(check, timeout=45))
+            if proof.get('retired') is True:
+                with self.mutex:
+                    if self.store.request_for(runner_id) != request_id:
+                        raise ValueError('任务占用已变化，请重新部署')
+                    self.store.release(runner_id, request_id)
         with self.mutex:
             if self.store.request_for(runner_id):
                 raise ValueError('Runner 有测试或待核对占用，暂不能部署/升级')
             for t in self.store.list('deployment'):
-                same = t['spec']['profile_id'] == spec['profile_id'] and (t['spec']['port'] == spec['port'] or (t['spec']['container'] == spec['container'] and t['spec']['base'] == spec['base']))
-                if same and t['state'] not in ('ready', 'failed'):
+                other = t['spec']
+                same_host = self.transport.profiles[other['profile_id']]['host'] == profile['host']
+                paths_overlap = lambda a,b: a == b or a.startswith(b.rstrip('/')+'/') or b.startswith(a.rstrip('/')+'/')
+                same = same_host and (bool({other['port'],other.get('access_port',other['port']+1000)} & {spec['port'],spec.get('access_port',spec['port']+1000)}) or paths_overlap(other['base'],spec['base']) or (other.get('host_path') and spec.get('host_path') and paths_overlap(other['host_path'],spec['host_path'])))
+                if same and t['state'] not in ('ready', 'failed', 'unknown'):
                     raise ValueError('该端口/目录已有部署或待核对记录，请勿重复安装')
             if not self.demo and not self.archive.is_file():
                 raise ValueError('未生成部署包，请先执行 python -m fleet.build_kit')
-            task = {'id': uuid.uuid4().hex, 'runner_id': runner_id, 'spec': spec, 'state': 'queued',
+            supersedes = [t['id'] for t in self.store.list('deployment') if t['state'] == 'unknown' and t['spec']['profile_id'] == spec['profile_id'] and t['spec']['port'] == spec['port']]
+            task = {'id': uuid.uuid4().hex, 'runner_id': runner_id, 'spec': spec, 'state': 'queued', 'supersedes':supersedes,
                     'detail': '等待部署', 'logs': '', 'created_at': time.time()}
             self.store.save('deployment', task)
             self.executor.submit(self.worker, task)
@@ -352,14 +433,38 @@ class Console:
                     time.sleep(.7)
                 result = {'status': {'activity': 'idle', 'root': task['spec']['base'], 'container': task['spec']['container'], 'version': 'fleet-v1'}, 'token': ''}
             else:
-                result = self.transport.deploy(task['spec'], self.archive, lambda msg: self.log(task, msg), step)
-            runner = {'id': task['runner_id'], 'spec': task['spec'], 'token': result['token'],
+                try:
+                    result = self.transport.deploy(task['spec'], self.archive, lambda msg: self.log(task, msg), step)
+                except AccessPendingError as pending:
+                    profile = self.transport.profiles[task['spec']['profile_id']]
+                    for attempt in range(1, 4):
+                        step('connecting', f'Runner 已就绪，自动恢复持久连接（{attempt}/3）')
+                        try:
+                            session = self.transport.session(profile['id'])
+                            self.transport.channels.install(session, task['spec'], profile, lambda message:self.log(task,message))
+                            result = self.transport.status(task['spec'])
+                            break
+                        except Exception as error:
+                            if attempt == 3:
+                                raise AccessPendingError(str(error), pending.runner) from None
+                            time.sleep(attempt)
+            clean_spec = {k:v for k,v in task['spec'].items() if not k.startswith('_')}
+            runner = {'id': task['runner_id'], 'spec': clean_spec, 'token': result['token'],
                       'status': result['status'], 'observed_at': time.time(), 'error': ''}
             self.store.save('runner', runner)
+            for old_id in task.get('supersedes', []):
+                old_task = self.store.get('deployment', old_id)
+                if old_task['state'] == 'unknown':
+                    old_task.update(state='failed', superseded_by=task['id'], detail='已由后续部署自动接续完成，见最新部署记录')
+                    self.store.save('deployment', old_task)
             step('ready', '部署完成，已加入 Runner 列表')
         except Exception as exc:
+            if isinstance(exc, AccessPendingError):
+                self.store.save('runner', {'id': task['runner_id'], 'spec': {k:v for k,v in task['spec'].items() if not k.startswith('_')}, 'token': '',
+                                          'status': exc.runner['status'], 'observed_at': time.time(),
+                                          'error': 'Runner 已更新，持久连接自动恢复未成功；可直接重新部署重试'})
             # SSH failures may leave a running remote installation. Retry must be deliberate.
-            state = 'failed' if self.demo or isinstance(exc, RemoteCommandError) or task['state'] in ('queued', 'checking', 'uploading') else 'unknown'
+            state = 'unknown' if isinstance(exc, AccessPendingError) else ('failed' if self.demo or isinstance(exc, RemoteCommandError) or task['state'] in ('queued', 'checking', 'uploading') else 'unknown')
             reason = str(exc).strip().splitlines()[-1] if str(exc).strip() else '请检查连接和部署日志'
             reason = re.sub(r'^(ValueError|RuntimeError):\s*', '', reason)
             step(state, '部署未完成：' + reason)
@@ -373,7 +478,7 @@ class Console:
         runners = [{'id': r['id'], 'spec': {k: r['spec'][k] for k in ('profile_id', 'port', 'container')},
                     'status': {**{k: r['status'].get(k) for k in ('activity', 'version')},
                                'active_job': {'target': {k: (r['status'].get('active_job') or {}).get('target', {}).get(k) for k in ('host', 'port', 'model')}} if r['status'].get('active_job') else None},
-                    'observed_at': r['observed_at'], 'error': '连接待管理员恢复' if r.get('error') else ''}
+                    'access_configured': r['access_configured'], 'observed_at': r['observed_at'], 'error': '连接待管理员恢复' if r.get('error') else ''}
                    for r in entries]
         return {'demo': self.demo, 'profiles': profiles, 'runners': runners}
 
@@ -393,14 +498,33 @@ class Console:
             lock = self.refresh_locks.setdefault(runner_id, threading.Lock())
             requested_version = self.refresh_versions.get(runner_id, 0)
         with lock:
+            version = self.refresh_versions.get(runner_id, 0)
             observed = self.refresh_times.get(runner_id, 0)
-            if time.monotonic() - observed < .5 and (not force or self.refresh_versions.get(runner_id, 0) > requested_version):
-                return {k:v for k,v in self.store.get('runner', runner_id).items() if k != 'token'}
+            cached_row = {k:v for k,v in self.store.get('runner', runner_id).items() if k != 'token'}
+            # Requests that arrived during a collection share its result, even
+            # if that collection took longer than the cache window or failed.
+            if version > requested_version or (version and not force and (cached_row.get('error') or cached_row['status'].get('activity') == 'idle') and time.monotonic() - observed < self.refresh_info(runner_id)['cache_window_seconds']):
+                return {**cached_row, 'refresh_info': self.refresh_info(runner_id, cached=True)}
+            started = time.monotonic()
             result = self.refresh_once(runner_id)
-            if not result.get('error'):
-                self.refresh_times[runner_id] = time.monotonic()
-                self.refresh_versions[runner_id] = self.refresh_versions.get(runner_id, 0) + 1
-            return result
+            finished = time.monotonic()
+            with self.mutex:
+                self.refresh_durations[runner_id] = finished - started
+                if not result.get('error'):
+                    self.refresh_samples.setdefault(runner_id, deque(maxlen=20)).append(finished - started)
+                self.refresh_times[runner_id] = finished
+                self.refresh_versions[runner_id] = version + 1
+            return {**result, 'refresh_info': self.refresh_info(runner_id)}
+
+    def refresh_info(self, runner_id, cached=False):
+        with self.mutex:
+            samples = self.refresh_samples.get(runner_id, ())
+            average = sum(samples) / len(samples) if samples else None
+            return {'cached': cached, 'sample_count': len(samples),
+                    'last_duration_seconds': self.refresh_durations.get(runner_id),
+                    'average_duration_seconds': average,
+                    'cache_window_seconds': max(1, min(10, math.ceil(2 * average))) if average is not None else 3,
+                    'cache_age_seconds': max(0, time.monotonic() - self.refresh_times[runner_id]) if runner_id in self.refresh_times else None}
 
     def refresh_once(self, runner_id):
         runner = self.store.get('runner', runner_id)
@@ -414,14 +538,50 @@ class Console:
             status = runner['status']
             request_id = self.store.request_for(runner_id)
             result = status.get('fleet_requests', {}).get(request_id, {})
-            if not self.demo and status.get('instance_id') == old.get('instance_id') and status.get('activity') == 'idle' and status.get('process_tree_confirmed_stopped') and result.get('state') in ('finished', 'rejected'):
+            restored_terminal = (result.get('restored_after_restart') is True and result.get('process_tree_confirmed_stopped') is True
+                                 and result.get('terminal_status') in ('completed', 'failed', 'stopped') and bool(result.get('job_id')) and bool(result.get('completed_at')))
+            if not self.demo and (status.get('instance_id') == old.get('instance_id') or restored_terminal) and status.get('activity') == 'idle' and status.get('process_tree_confirmed_stopped') and result.get('state') in ('finished', 'rejected'):
                 self.store.release(runner_id, request_id)
         except Exception as exc:
             runner.update(error=str(exc), observed_at=time.time())
         with self.mutex:
-            self.store.get('runner', runner_id)  # A late refresh must not revive a removed entry.
+            latest = self.store.get('runner', runner_id)  # Do not revive removed or superseded entries.
+            if latest['spec'] != runner['spec']:
+                return {k:v for k,v in latest.items() if k != 'token'}
             self.store.save('runner', runner)
         return {k: v for k, v in runner.items() if k != 'token'}
+
+    def recover_completed_task(self, runner_id):
+        with self.mutex:
+            lock = self.refresh_locks.setdefault(runner_id, threading.Lock())
+        with lock:
+            row = self.store.get('runner', runner_id)
+            request_id = self.store.request_for(runner_id)
+            if not request_id:
+                raise ValueError('该 Runner 没有待核对占用，请刷新状态')
+            session = self.transport.session(row['spec']['profile_id'])
+            status = self.transport.status(row['spec'])['status']
+            if status.get('fleet_requests', {}).get(request_id, {}).get('state') != 'unknown':
+                raise ValueError('任务仍在执行或不是可恢复状态，未停止 Runner')
+            source = (ROOT/'fleet/runner-overlay/scripts/runner.py').read_text(encoding='utf-8')
+            helper = (ROOT/'fleet/remote_helper.py').read_text(encoding='utf-8')
+            args = [row['spec'], request_id, status['instance_id'], source]
+            script = helper + '\nprint(json.dumps(recover_completed_job(*json.loads(' + repr(json.dumps(args)) + '))))\n'
+            try:
+                proof = json.loads(session.execute(script, timeout=90))
+            except Exception:
+                raise ValueError('恢复未确认，未释放中心占用。需确认原任务成功、无活跃子进程且 SSH 可用；请核对服务器日志') from None
+            state = proof['status']
+            if proof['request_id'] != request_id or state['instance_id'] == status['instance_id'] or state['activity'] != 'idle' or not state['process_tree_confirmed_stopped']:
+                raise ValueError('恢复证明不完整，中心占用仍保留')
+            with self.mutex:
+                if self.store.request_for(runner_id) != request_id:
+                    raise ValueError('占用记录已变化，请重新核对')
+                row.update(status=state, observed_at=time.time(), error='')
+                self.store.save('runner', row)
+                self.store.release(runner_id, request_id)
+                self.refresh_times.pop(runner_id, None)
+            return {'ok': True, 'detail': '已核实任务成功且无活跃子进程，结果保留，Runner 已恢复空闲'}
 
     def reconcile(self, task_id):
         task = self.store.get('deployment', task_id)
@@ -429,6 +589,20 @@ class Console:
             raise ValueError('只核对状态未知的部署')
         if self.demo:
             raise ValueError('演示模式没有真实远端结果')
+        previous = self.runner_for_endpoint(task['spec'])
+        if previous:
+            task['runner_id'] = previous['id']
+        if self.store.request_for(task['runner_id']):
+            raise ValueError('Runner 有任务占用，不能迁移连接')
+        if task['spec'].get('durable'):
+            profile = self.transport.profiles[task['spec']['profile_id']]
+            session = self.transport.session(profile['id'])
+            helper = (ROOT/'fleet/remote_helper.py').read_text(encoding='utf-8')
+            check = helper + '\nspec=json.loads(' + repr(json.dumps(task['spec'])) + ')\nstatus=read_status(spec)["status"]\nverify_runner_owner(spec)\nprint(json.dumps(status))\n'
+            verified = json.loads(session.execute(check, timeout=45))
+            self.store.save('runner', {'id':task['runner_id'], 'spec':task['spec'], 'token':'', 'status':verified,
+                                      'observed_at':time.time(), 'error':'Runner 身份已核验，持久连接正在迁移；请完成核对接入'})
+            self.transport.channels.install(session, task['spec'], profile, lambda message: self.log(task, message))
         result = self.transport.status(task['spec'])
         runner = {'id': task['runner_id'], 'spec': task['spec'], 'token': result['token'], 'status': result['status'],
                   'observed_at': time.time(), 'error': ''}
@@ -438,6 +612,14 @@ class Console:
         return task
 
     def proxy(self, runner_id, method, path, body, owner=None):
+        if method == 'POST' and path == '/api/datasets/generate':
+            # Snapshot the exact request, including seed and connection identity.
+            # Jobs and all other writes retain their existing one-shot semantics.
+            snapshot = json.dumps(body)
+            return confirm_generation(lambda: self._proxy_once(runner_id, method, path, json.loads(snapshot), owner))
+        return self._proxy_once(runner_id, method, path, body, owner)
+
+    def _proxy_once(self, runner_id, method, path, body, owner=None):
         if self.demo:
             raise ValueError('演示模式不连接真实 Runner；请用真实模式测试部署与评测')
         runner = self.store.get('runner', runner_id)
@@ -450,10 +632,7 @@ class Console:
                 raise ValueError('第一版中心模式禁止修改执行文件；请通过服务面板检查连接')
             if path == '/api/check-service':
                 service = body.get('service') or {}
-                if service.get('host') not in profile.get('service_hosts', [profile['host'], '127.0.0.1', 'localhost']):
-                    raise ValueError('服务地址未获管理员批准，请配置 service_hosts')
-                if profile.get('mode') != 'session' and service.get('port') not in profile.get('service_ports', [8000]):
-                    raise ValueError('服务端口未获管理员批准，请配置 service_ports')
+                validate_service_endpoint(service)
                 tokenizer = service.get('tokenizer_path', '')
                 if '..' in tokenizer.split('/') or not any(tokenizer == root or tokenizer.startswith(root.rstrip('/') + '/') for root in profile.get('tokenizer_roots', ['/models', '/mnt/weight'])):
                     raise ValueError('tokenizer 路径未获管理员批准，请配置 tokenizer_roots')
@@ -462,17 +641,25 @@ class Console:
                 if target.get('aisbench_path'):
                     raise ValueError('中心模式不允许请求覆盖 AISBench 可执行路径')
                 host = body.get('host')
-                if host not in profile.get('service_hosts', [profile['host'], '127.0.0.1', 'localhost']):
-                    raise ValueError('服务地址未获管理员批准')
-                if profile.get('mode') != 'session' and body.get('port') not in profile.get('service_ports', [8000]):
-                    raise ValueError('服务端口未获管理员批准')
+                validate_service_endpoint(body)
                 normalized = profile['host'] if host in ('127.0.0.1', 'localhost') else host
                 normalized = profile.get('service_aliases', {}).get(normalized, normalized)
                 target_key = f'{normalized}:{body.get("port")}'
                 request_id = uuid.uuid4().hex
                 with self.mutex:
                     self.store.get('runner', runner_id)
-                    self.store.claim(runner_id, target_key, request_id)
+                    if any(t.get('runner_id') == runner_id and t['state'] not in ('ready','failed') for t in self.store.list('deployment')):
+                        raise ValueError('Runner 正在部署或接入待核对，暂不能启动测试')
+                    try:
+                        self.store.claim(runner_id, target_key, request_id)
+                    except ValueError:
+                        info = self.store.conflict_info(runner_id, target_key)
+                        if not info:
+                            raise
+                        occupied = self.store.get('runner', info['runner'])
+                        peer = self.transport.profiles[occupied['spec']['profile_id']]
+                        address = f"{peer['host']}:{occupied['spec'].get('port', '?')}"
+                        raise ValueError(f"Runner 或目标服务已被占用：Runner {address}，目标服务 {info['target']}，占用记录 {info['request'][:12]}；请等待当前任务完成") from None
                     if owner:
                         self.store.save('job-owner', {'id':'job-owner:'+request_id, 'owner':owner, 'runner':runner_id})
                 body['fleet_request_id'] = request_id
@@ -556,16 +743,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Content-Length', '0')
                 self.end_headers()
                 return
-            if method == 'GET' and path in ('/admin/', '/style.css', '/app.js'):
-                file = STATIC / {'/admin/': 'index.html', '/style.css': 'style.css', '/app.js': 'app.js'}[path]
-                mime = {'/admin/': 'text/html; charset=utf-8', '/style.css': 'text/css; charset=utf-8', '/app.js': 'text/javascript; charset=utf-8'}[path]
+            if method == 'GET' and path in ('/admin/', '/style.css', '/app.js', '/storage-cleanup.js'):
+                file = STATIC / {'/admin/': 'index.html', '/style.css': 'style.css', '/app.js': 'app.js', '/storage-cleanup.js':'storage-cleanup.js'}[path]
+                mime = {'/admin/': 'text/html; charset=utf-8', '/style.css': 'text/css; charset=utf-8', '/app.js': 'text/javascript; charset=utf-8', '/storage-cleanup.js':'text/javascript; charset=utf-8'}[path]
                 return self.send(200, file.read_bytes(), mime)
             body = None
             if method == 'POST':
                 if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                     return self.send(403, {'error': '需要 JSON 请求'})
                 size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 100000:
+                if not 0 < size <= (1_000_000 if path == '/api/storage/delete' else 100000):
                     raise ValueError('请求大小无效')
                 body = json.loads(self.rfile.read(size))
                 if not isinstance(body, dict):
@@ -621,7 +808,8 @@ class Handler(BaseHTTPRequestHandler):
                             self.app.store.db.execute("DELETE FROM objects WHERE kind='user-session' AND json_extract(body,'$.expires') < ?", (time.time(),))
                     new_cookie = f'fleet_user_{self.server.server_port}={sid}; HttpOnly; SameSite=Strict; Path=/'
                 return self.send(200, {**self.app.user_view(), 'csrf': user['csrf'],
-                                       'selected_runner_id': user['selected']}, cookie=new_cookie)
+                                       'selected_runner_id': user['selected'],
+                                       'selected_runner_ids': sorted(set(user.get('selected_runners', [])) | ({user['selected']} if user.get('selected') else set()))}, cookie=new_cookie)
             # Evaluation pages and assets are public on this loopback-only server.
             # Their API session has no machine, installation or administrator privileges.
             route = re.fullmatch(r'/r/([a-f0-9]{16})(/.*)', path)
@@ -677,6 +865,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {'ok': True})
             if path == '/api/audit' and method == 'GET':
                 return self.send(200, {'events': self.app.store.list('audit')[:200]})
+            if path == '/api/storage/scan' and method == 'POST':
+                if self.app.demo:
+                    raise ValueError('演示模式不执行 Runner 存储扫描或删除')
+                return self.send(202, self.app.storage_cleanup.scan(body.get('days', 7)))
+            if path == '/api/storage/delete' and method == 'POST':
+                if self.app.demo:
+                    raise ValueError('演示模式不执行 Runner 存储扫描或删除')
+                return self.send(202, self.app.storage_cleanup.delete(body.get('scan_id'), body.get('selected')))
+            if path.startswith('/api/storage/tasks/') and method == 'GET':
+                return self.send(200, self.app.storage_cleanup.view(path.rsplit('/', 1)[1]))
             if path == '/api/logout' and method == 'POST':
                 self.app.sessions.pop(session.value, None)
                 self.app.session_admin.pop(session.value, None)
@@ -688,7 +886,7 @@ class Handler(BaseHTTPRequestHandler):
                     user['refreshed'].pop(body['runner_id'], None)
                     raise ValueError('Runner 连接不可用，请联系管理员恢复连接')
                 user['refreshed'][body['runner_id']] = time.time()
-                return self.send(200, {'ok': True})
+                return self.send(200, {'ok': True, 'refresh_info': result['refresh_info'], 'runner': next(r for r in self.app.user_view()['runners'] if r['id'] == body['runner_id'])})
             if path == '/api/user/select' and method == 'POST' and user:
                 rid = body.get('runner_id')
                 if time.time() - user['refreshed'].get(rid, 0) > 60:
@@ -699,6 +897,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Runner 连接不可用，请联系管理员恢复连接')
                 if result['status'].get('activity') != 'idle':
                     raise ValueError('Runner 当前非空闲，请刷新后选择其他 Runner')
+                selected = set(user.get('selected_runners', []))
+                if user.get('selected'):
+                    selected.add(user['selected'])
+                selected.add(rid)
+                user['selected_runners'] = sorted(selected & {r['id'] for r in self.app.store.list('runner')})
                 user['selected'] = rid
                 self.app.store.save('user-session', user)
                 return self.send(200, {'runner_id': rid})
@@ -719,6 +922,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.app.connect_machine(body))
             if path == '/api/machines/inspect' and method == 'POST':
                 return self.send(200, self.app.inspect_machine(body['profile_id']))
+            if path == '/api/machines/reconnect' and method == 'POST':
+                profile_id = body['profile_id']
+                session = self.app.transport.session(profile_id)
+                if not self.app.transport.authorizations.vault.has(profile_id):
+                    raise ValueError('此机器尚未首次授权自动管理，请登录一次服务器')
+                with session.lock:
+                    session.connect()
+                return self.send(200, {'profile_id':profile_id, 'inventory':self.app.inspect_machine(profile_id)})
+            if path == '/api/machines/revoke' and method == 'POST':
+                profile_id = body['profile_id']
+                if any(self.app.store.request_for(r['id']) for r in self.app.store.list('runner') if r['spec']['profile_id']==profile_id):
+                    raise ValueError('该机器仍有评测任务，暂不能撤销管理授权')
+                self.app.transport.authorizations.revoke(profile_id, self.app.transport.session(profile_id))
+                self.app.transport.sessions.pop(profile_id,None)
+                for profile in self.app.profiles:
+                    if profile['id']==profile_id:profile['auto_manage']=False
+                temporary=self.app.config_path.with_name(self.app.config_path.name+'.'+uuid.uuid4().hex+'.tmp')
+                temporary.write_text(json.dumps({'profiles':self.app.profiles},ensure_ascii=False,indent=2),encoding='utf-8')
+                temporary.chmod(0o600);temporary.replace(self.app.config_path)
+                return self.send(200, {'ok':True,'detail':'管理 SSH 授权已撤销；日常评测 TLS 连接保持独立'})
             if path == '/api/enrollments' and method == 'POST':
                 return self.send(201, self.app.create_enrollment(body))
             if path == '/api/enrollments/import' and method == 'POST':
@@ -740,11 +963,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.app.reconcile(path.split('/')[-2]))
             if path == '/api/refresh' and method == 'POST':
                 return self.send(200, self.app.refresh(body['runner_id']))
+            if re.fullmatch(r'/api/runners/[a-f0-9]{16}/recover-task', path) and method == 'POST':
+                return self.send(200, self.app.recover_completed_task(path.split('/')[3]))
             match = re.fullmatch(r'/r/([a-f0-9]{16})(/.*)', path)
             if match:
                 rid, tail = match.groups()
                 self.app.store.get('runner', rid)
-                if method == 'POST' and user and user.get('selected') != rid and not tail.endswith('/stop'):
+                if method == 'POST' and user and user.get('selected') != rid and rid not in user.get('selected_runners', []) and not tail.endswith('/stop'):
                     return self.send(403, {'error': '请先刷新状态并选择此 Runner'})
                 kit = ROOT / 'fleet/runner-overlay'
                 if method == 'GET' and tail == '/':
@@ -776,7 +1001,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, {'error': '页面不存在'})
         except (ValueError, KeyError, TypeError) as exc:
             return self.send(400, {'error': str(exc)})
-        except Exception:
+        except Exception as exc:
+            location = traceback.extract_tb(exc.__traceback__)[-1]
+            print(f'中心请求异常：{type(exc).__name__}；位置：{Path(location.filename).name}:{location.lineno}', flush=True)
             return self.send(502, {'error': '请求未完成，请查看部署记录或刷新连接'})
 
     def do_GET(self):
@@ -819,10 +1046,17 @@ def main():
     networks = [ipaddress.ip_network(value, strict=False) for value in (args.allow_net or settings.get('allowed_networks', []))]
     if external and (not networks or any(net.prefixlen == 0 for net in networks)):
         parser.error('共享模式需要明确的 --allow-net 允许网段，不允许全部互联网来源')
-    app = Console(args.config, args.data or ROOT / ('.fleet-demo' if args.demo else '.fleet-data'), args.demo)
-    if external and not app.accounts.list():
-        parser.error('请先运行 python -m fleet.admin create 管理员账号')
     server = BoundedServer((args.bind, args.port), Handler)
+    app = None
+    try:
+        app = Console(args.config, args.data or ROOT / ('.fleet-demo' if args.demo else '.fleet-data'), args.demo)
+        if external and not app.accounts.list():
+            parser.error('请先运行 python -m fleet.admin create 管理员账号')
+    except BaseException:
+        server.server_close()
+        if app:
+            app.transport.close();app.executor.shutdown(wait=False)
+        raise
     server.allowed_networks = networks
     server.tls = bool(args.cert)
     server.allowed_hosts = {f'127.0.0.1:{args.port}', f'localhost:{args.port}'}

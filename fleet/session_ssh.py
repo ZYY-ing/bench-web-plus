@@ -6,6 +6,7 @@ authorized_keys changes. Host identity is pinned before password authentication.
 import base64
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
 import socket
@@ -14,6 +15,16 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def quiet_transport(client):
+    # Expected reconnect failures are represented in connection status. Paramiko's
+    # transport traceback per retry would otherwise flood a long-running centre.
+    logger = logging.getLogger('benchweb.ssh')
+    if not any(isinstance(handler, logging.NullHandler) for handler in logger.handlers):
+        logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    client.set_log_channel('benchweb.ssh')
 
 
 class RemoteCommandError(ValueError):
@@ -45,14 +56,25 @@ def validate_endpoint(body):
 
 def probe(host, port):
     module = paramiko_module()
-    with socket.create_connection((host, port), timeout=10) as sock:
-        transport = module.Transport(sock)
-        try:
-            transport.start_client(timeout=10)
-            key = transport.get_remote_server_key()
-            return {'fingerprint': fingerprint(key), 'key_type': key.get_name(), 'public_key': key.get_base64()}
-        finally:
-            transport.close()
+    try:
+        with socket.create_connection((host, port), timeout=10) as sock:
+            transport = module.Transport(sock)
+            try:
+                transport.start_client(timeout=10)
+                key = transport.get_remote_server_key()
+                return {'fingerprint': fingerprint(key), 'key_type': key.get_name(), 'public_key': key.get_base64()}
+            finally:
+                transport.close()
+    except socket.gaierror:
+        raise ValueError('无法解析服务器主机名，请核对地址或使用服务器 IP；尚未进行密码认证') from None
+    except TimeoutError:
+        raise ValueError('检查指纹超时：请确认中心电脑可访问服务器 SSH 端口，并检查 VPN、路由及防火墙；尚未进行密码认证') from None
+    except ConnectionRefusedError:
+        raise ValueError('服务器拒绝 SSH 连接：请核对端口及 SSH 服务是否启动；尚未进行密码认证') from None
+    except module.SSHException:
+        raise ValueError('SSH 握手失败：请确认填写的是 SSH 端口，并检查服务器 SSH 日志和算法兼容性；尚未进行密码认证') from None
+    except OSError:
+        raise ValueError('无法连接服务器 SSH 端口：请检查中心电脑到服务器的网络及访问限制；尚未进行密码认证') from None
 
 
 class SessionSSH:
@@ -63,6 +85,7 @@ class SessionSSH:
                 if fingerprint(key) != expected_fingerprint:
                     raise ValueError('服务器 SSH 指纹变化，拒绝发送密码')
         self.client = module.SSHClient()
+        quiet_transport(self.client)
         self.client.set_missing_host_key_policy(PinnedKey())
         # Do not call load_system_host_keys/load_host_keys: those could read personal files.
         try:
@@ -191,6 +214,7 @@ else:print('null')
 
 
 INSPECT_SCRIPT = '''import json,subprocess
+from pathlib import Path
 def run(argv):return subprocess.check_output(argv,stderr=subprocess.STDOUT).decode()
 ids=run(['docker','ps','-aq']).split()
 containers=[]
@@ -200,18 +224,21 @@ if ids:
 from concurrent.futures import ThreadPoolExecutor
 probe_code="""import hashlib,json,os,sys
 from pathlib import Path
-base=Path(sys.argv[1]);source=base/'scripts/runner.py';running=False
+base=Path(sys.argv[1]);container=sys.argv[2];source=base/'scripts/runner.py';running=False
 try:
  pid=int((base/'runner.pid').read_text());proc=Path('/proc')/str(pid)
- running=(proc/'cwd').resolve()==base and any(a.endswith(b'runner.py') for a in (proc/'cmdline').read_bytes().split(bytes([0])))
+ env=dict(e.split(b'=',1) for e in (proc/'environ').read_bytes().split(bytes([0])) if b'=' in e)
+ port=int(env.get(b'ASCEND_BENCH_PORT',b'18787'))
+ inodes={line.split()[9] for line in (proc/'net/tcp').read_text().splitlines()[1:] if line.split()[1]=='0100007F:'+format(port,'04X') and line.split()[3]=='0A'}
+ running=env.get(b'ASCEND_BENCH_CONTAINER',b'').decode()==container and (proc/'cwd').resolve()==base and any(a.endswith(b'runner.py') for a in (proc/'cmdline').read_bytes().split(bytes([0]))) and bool(inodes) and any(os.readlink(fd) in {'socket:['+i+']' for i in inodes} for fd in (proc/'fd').iterdir())
 except (OSError,ValueError):pass
-print(json.dumps({'runner_installed':source.is_file(),'runner_running':running}))
+print(json.dumps({'runner_installed':source.is_file(),'runner_files_visible':source.is_file(),'runner_running':running}))
 """
 def check_runner(c):
  if c['state']!='running':return c
  base=globals().get('RUNNER_BASES',{}).get(c['name'],'/home/ascend_bench/runner')
  try:
-  raw=subprocess.check_output(['docker','exec','-e','PYTHONDONTWRITEBYTECODE=1',c['name'],'python3','-I','-S','-c',probe_code,base],stderr=subprocess.DEVNULL,timeout=8)
+  raw=subprocess.check_output(['docker','exec','-e','PYTHONDONTWRITEBYTECODE=1',c['name'],'python3','-I','-S','-c',probe_code,base,c['name']],stderr=subprocess.DEVNULL,timeout=8)
   c.update(json.loads(raw));c['runner_checked']=True
  except Exception:c['runner_checked']=False
  return c
@@ -220,5 +247,12 @@ images=[]
 for row in run(['docker','image','ls','--format','{{json .}}']).splitlines():
  x=json.loads(row)
  if x['Repository']!='<none>' and x['Tag']!='<none>':images.append(x['Repository']+':'+x['Tag'])
-print(json.dumps({'containers':containers,'images':images}))
+ports=set()
+for name in ('tcp','tcp6'):
+ try:lines=(Path('/proc/net')/name).read_text().splitlines()[1:]
+ except FileNotFoundError:continue
+ for line in lines:
+  fields=line.split()
+  if len(fields)>=4 and fields[3]=='0A':ports.add(int(fields[1].rsplit(':',1)[1],16))
+print(json.dumps({'containers':containers,'images':images,'listening_ports':sorted(ports)}))
 '''

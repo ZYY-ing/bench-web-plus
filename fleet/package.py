@@ -9,13 +9,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default='ascend-bench-fleet-v1-local.zip')
+    parser.add_argument('--name', default='bench-web-plus-shared-current.zip')
     args = parser.parse_args()
     if Path(args.name).name != args.name or not args.name.endswith('.zip'):
         parser.error('输出名称必须是单个 ZIP 文件名')
     output = ROOT.parent / 'outputs' / args.name
     output.parent.mkdir(exist_ok=True)
-    files = [ROOT / name for name in ('README.md', 'start-fleet.cmd', 'setup-shared-center.cmd', 'start-fleet.sh', 'requirements-admin.txt', 'fleet/README.md', 'dist/ascend-bench-fleet-kit.tar.gz')]
+    files = [ROOT / name for name in ('README.md', 'start-fleet.cmd', 'setup-shared-center.cmd', 'install-center-autostart.cmd', 'start-fleet.sh', 'requirements-admin.txt', 'fleet/README.md', 'dist/ascend-bench-fleet-kit.tar.gz')]
     files += [p for p in (ROOT / 'docs').rglob('*') if p.is_file()]
     (ROOT / 'dist/ascend-bench-fleet-kit.tar.gz.sha256').write_text(hashlib.sha256((ROOT / 'dist/ascend-bench-fleet-kit.tar.gz').read_bytes()).hexdigest() + '  ascend-bench-fleet-kit.tar.gz\n', encoding='utf-8')
     files.append(ROOT / 'dist/ascend-bench-fleet-kit.tar.gz.sha256')

@@ -135,6 +135,139 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(len(calls),3)
             self.assertEqual(len(rows),20)
 
+    def test_refresh_cache_uses_measured_duration_and_does_not_slide(self):
+        self.app.demo = False
+        row = self.app.runners()[0]
+        clock = [100.0]
+        def status(spec):
+            clock[0] += 1.2
+            return {'status': row['status'], 'token': 'never-return-this'}
+        with patch('fleet.app.time.monotonic', side_effect=lambda: clock[0]), patch.object(self.app.transport, 'status', side_effect=status) as remote:
+            first = self.app.refresh(row['id'])
+            self.assertFalse(first['refresh_info']['cached'])
+            self.assertAlmostEqual(first['refresh_info']['average_duration_seconds'], 1.2)
+            self.assertEqual(first['refresh_info']['cache_window_seconds'], 3)
+            self.assertNotIn('token', first)
+            clock[0] += 2.9
+            cached = self.app.refresh(row['id'])
+            self.assertTrue(cached['refresh_info']['cached'])
+            self.assertEqual(remote.call_count, 1)
+            clock[0] += .2
+            self.assertFalse(self.app.refresh(row['id'])['refresh_info']['cached'])
+            self.assertEqual(remote.call_count, 2)
+            self.app.refresh(row['id'], force=True)
+            self.assertEqual(remote.call_count, 3)
+
+    def test_busy_runner_refresh_does_not_reuse_stale_busy_cache(self):
+        self.app.demo = False
+        row = self.app.runners()[0]
+        responses = [{'token': '', 'status': {**row['status'], 'activity': 'running'}},
+                     {'token': '', 'status': {**row['status'], 'activity': 'idle'}}]
+        with patch.object(self.app.transport, 'status', side_effect=responses) as remote:
+            self.assertEqual(self.app.refresh(row['id'])['status']['activity'], 'running')
+            self.assertEqual(self.app.refresh(row['id'])['status']['activity'], 'idle')
+            self.assertEqual(remote.call_count, 2)
+
+    def test_failed_refresh_is_shared_without_counting_as_success(self):
+        self.app.demo = False
+        row = self.app.runners()[0]
+        with patch.object(self.app.transport, 'status', side_effect=ValueError('offline')) as remote:
+            first = self.app.refresh(row['id'])
+            self.assertEqual(first['refresh_info']['sample_count'], 0)
+            self.assertEqual(first['refresh_info']['cache_window_seconds'], 3)
+            with concurrent.futures.ThreadPoolExecutor(20) as pool:
+                rows = list(pool.map(lambda _: self.app.refresh(row['id']), range(20)))
+            self.assertEqual(remote.call_count, 1)
+            self.assertTrue(all(r['error'] and r['refresh_info']['cached'] for r in rows))
+
+    def test_slow_inflight_refresh_is_shared_and_samples_are_bounded(self):
+        self.app.demo = False
+        row = self.app.runners()[0]
+        entered, release = threading.Event(), threading.Event()
+        def status(spec):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('test did not release collection')
+            return {'status': row['status'], 'token': ''}
+        with patch.object(self.app.transport, 'status', side_effect=status) as remote:
+            with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                first = pool.submit(self.app.refresh, row['id'])
+                try:
+                    self.assertTrue(entered.wait(2))
+                    others = [pool.submit(self.app.refresh, row['id']) for _ in range(7)]
+                finally:
+                    release.set()
+                self.assertFalse(first.result()['refresh_info']['cached'])
+                self.assertTrue(all(f.result()['refresh_info']['cached'] for f in others))
+                self.assertEqual(remote.call_count, 1)
+            for _ in range(25):
+                self.app.refresh(row['id'], force=True)
+            self.assertEqual(self.app.refresh_info(row['id'])['sample_count'], 20)
+            self.assertEqual(self.app.refresh_info(row['id'])['cache_window_seconds'], 1)
+        self.app.refresh_samples[row['id']].append(1000)
+        self.assertEqual(self.app.refresh_info(row['id'])['cache_window_seconds'], 10)
+
+    def test_admin_and_user_refresh_share_the_same_collection(self):
+        admin, user = self.browser(), self.browser()
+        admin_csrf = self.request(admin, '/api/login', {'token': 'demo'})['csrf']
+        user_data = self.request(user, '/api/user/bootstrap')
+        rid = user_data['runners'][0]['id']
+        self.app.demo = False
+        row = self.app.runners()[0]
+        with patch.object(self.app.transport, 'status', return_value={'status': row['status'], 'token': ''}) as remote:
+            first = self.request(admin, '/api/refresh', {'runner_id': rid}, admin_csrf)
+            second = self.request(user, '/api/user/refresh', {'runner_id': rid}, user_data['csrf'])
+            self.assertFalse(first['refresh_info']['cached'])
+            self.assertTrue(second['refresh_info']['cached'])
+            self.assertEqual(remote.call_count, 1)
+            self.request(user, '/api/user/select', {'runner_id': rid}, user_data['csrf'])
+            self.assertEqual(remote.call_count, 2)
+
+    def test_tabs_keep_independent_runner_access_without_authorizing_unselected_runners(self):
+        browser=self.browser();context=self.request(browser,'/api/user/bootstrap');csrf=context['csrf']
+        first=self.app.store.list('runner')[0]
+        ids=[first['id'],'a'*16,'b'*16]
+        for index,rid in enumerate(ids[1:],1):
+            row=json.loads(json.dumps(first));row['id']=rid;row['spec']['port']+=index;self.app.store.save('runner',row)
+        for rid in ids[:2]:
+            self.request(browser,'/api/user/refresh',{'runner_id':rid},csrf)
+            self.request(browser,'/api/user/select',{'runner_id':rid},csrf)
+        refreshed=self.request(browser,'/api/user/bootstrap')
+        self.assertEqual(set(refreshed['selected_runner_ids']),set(ids[:2]))
+        self.assertEqual(refreshed['selected_runner_id'],ids[1])
+        calls=[]
+        def proxy(rid,method,path,body,owner=None):
+            calls.append(rid);return 202,'application/json',b'{"state":"preparing"}'
+        with patch.object(self.app,'proxy',side_effect=proxy):
+            for rid in ids[:2]:self.request(browser,'/r/'+rid+'/api/datasets/generate',{'generation_id':'same-tab'},csrf)
+            with self.assertRaises(urllib.error.HTTPError) as error:self.request(browser,'/r/'+ids[2]+'/api/datasets/generate',{},csrf)
+            self.assertEqual(error.exception.code,403)
+            outsider=self.browser();other=self.request(outsider,'/api/user/bootstrap')
+            with self.assertRaises(urllib.error.HTTPError):self.request(outsider,'/r/'+ids[0]+'/api/datasets/generate',{},other['csrf'])
+        self.assertEqual(calls,ids[:2])
+        self.app.user_sessions.clear()
+        restored=self.request(browser,'/api/user/bootstrap')
+        self.assertEqual(set(restored['selected_runner_ids']),set(ids[:2]))
+
+    def test_legacy_task_recovery_requires_new_idle_instance_before_release(self):
+        row = self.app.runners()[0]
+        request_id = 'recovery-request'
+        self.app.store.claim(row['id'], '192.0.2.10:8000', request_id)
+        old = {**row['status'], 'instance_id': 'old', 'activity': 'running',
+               'fleet_requests': {request_id: {'state': 'unknown'}}}
+        session = unittest.mock.MagicMock()
+        self.app.transport.sessions[row['spec']['profile_id']] = session
+        new = {**old, 'instance_id': 'new', 'activity': 'idle', 'process_tree_confirmed_stopped': True}
+        with patch.object(self.app.transport, 'status', return_value={'status': old}):
+            session.execute.return_value = json.dumps({'status': old, 'request_id': request_id})
+            with self.assertRaisesRegex(ValueError, '恢复证明不完整'):
+                self.app.recover_completed_task(row['id'])
+            self.assertEqual(self.app.store.request_for(row['id']), request_id)
+            session.execute.return_value = json.dumps({'status': new, 'request_id': request_id, 'job_id': 'real-test'})
+            self.assertTrue(self.app.recover_completed_task(row['id'])['ok'])
+            self.assertIsNone(self.app.store.request_for(row['id']))
+            self.assertEqual(self.app.store.get('runner', row['id'])['status']['activity'], 'idle')
+
     def test_users_are_not_evicted_at_20_or_256(self):
         # Pre-existing valid sessions must not be silently evicted.
         import time
@@ -205,6 +338,132 @@ class SharedTests(unittest.TestCase):
         self.assertTrue(result['requires_login'])
         with self.assertRaises(urllib.error.HTTPError):self.request(browser,'/api/admins')
         with self.assertRaises(urllib.error.HTTPError):self.request(self.browser(),'/api/login',{'token':self.app.token})
+
+    def test_container_migration_keeps_gateway_credentials_and_original_access_directory(self):
+        import ast
+        old_spec = self.app.runners()[0]['spec']
+        spec = {**old_spec, 'container': 'new-existing-container', 'access_port': 19787}
+        profile = self.app.transport.profiles[spec['profile_id']]
+        channels = Channels(self.root/'migration')
+        old_key, new_key = identity(old_spec), identity(spec)
+        url = 'https://' + profile['host'] + ':19787'
+        channels.entries[old_key] = {'profile_id': profile['id'], 'url': url, 'secret': 'working-secret', 'ca': 'old-ca'}
+        channels.entries[new_key] = {'profile_id': profile['id'], 'url': url, 'secret': 'failed-provisional-secret', 'ca': 'old-ca'}
+        status = {'root': spec['base'], 'container': spec['container'], 'activity': 'idle', 'process_tree_confirmed_stopped': True}
+        session = unittest.mock.MagicMock()
+        session.execute.side_effect = [json.dumps(status), json.dumps({'access_id':old_key[:24], 'credential_key':old_key, 'reused':False})]
+        result = {'status':200, 'body':base64.b64encode(json.dumps(status).encode()).decode()}
+        with patch('fleet.persistent.issue', return_value={'cert':'cert','key':'key','ca':'new-ca'}), patch.object(channels, 'request', return_value=result):
+            channels.install(session, spec, profile, lambda _: None)
+        self.assertEqual(channels.entries[new_key]['secret'], 'working-secret')
+        self.assertEqual(channels.entries[new_key]['access_id'], old_key[:24])
+        self.assertNotIn(old_key, channels.entries)
+        tree = ast.parse(session.execute.call_args_list[1].args[0])
+        payload = json.loads(tree.body[-1].body[0].value.args[0].args[0].args[0].args[0].value)
+        self.assertEqual(payload['port'], 19787)
+        self.assertEqual(payload['candidates'][old_key]['secret'], 'working-secret')
+        self.assertTrue(payload['restart'])
+        self.assertEqual(Channels(self.root/'migration').entries, channels.entries)
+
+    def test_failed_gateway_migration_keeps_working_credentials(self):
+        spec = self.app.runners()[0]['spec']
+        profile = self.app.transport.profiles[spec['profile_id']]
+        channels = Channels(self.root/'migration-failure')
+        key = identity(spec)
+        original = {'profile_id':profile['id'], 'url':'https://'+profile['host']+':19787', 'secret':'working', 'ca':'trusted'}
+        channels.entries[key] = dict(original)
+        status = {'root':spec['base'], 'container':spec['container'], 'activity':'idle', 'process_tree_confirmed_stopped':True}
+        session = unittest.mock.MagicMock()
+        session.execute.side_effect = [json.dumps(status), RuntimeError('port occupied')]
+        with patch('fleet.persistent.issue', return_value={'cert':'cert','key':'key','ca':'new-ca'}):
+            with self.assertRaisesRegex(ValueError, '安装未确认'):
+                channels.install(session, spec, profile, lambda _:None)
+        self.assertEqual(channels.entries[key], original)
+
+    def test_partial_container_deployment_is_explicit_and_reconcile_preserves_runner_id(self):
+        from .transport import AccessPendingError
+        row = self.app.runners()[0]
+        spec = {**row['spec'], 'container':'new-existing-container', 'durable':True}
+        status = {**row['status'], 'container':spec['container'], 'root':spec['base']}
+        task = {'id':'migration-task','runner_id':row['id'],'spec':spec,'state':'queued','logs':'','created_at':0}
+        self.app.demo = False
+        with patch.object(self.app.transport, 'deploy', side_effect=AccessPendingError('gateway unavailable', {'status':status})):
+            self.app.worker(task)
+        current = self.app.store.get('runner', row['id'])
+        self.assertEqual(task['state'], 'unknown')
+        self.assertEqual(current['spec']['container'], spec['container'])
+        self.assertIn('持久连接自动恢复未成功', current['error'])
+        # Old interrupted tasks could have been assigned a second id. Reconcile
+        # must adopt the existing endpoint's id rather than duplicate its row.
+        task['runner_id'] = 'historical-new-id'
+        self.app.store.save('deployment',task)
+        session = unittest.mock.MagicMock()
+        session.execute.return_value = json.dumps(status)
+        with patch.object(self.app.transport, 'session', return_value=session), patch.object(self.app.transport.channels, 'install') as install, patch.object(self.app.transport, 'status', return_value={'status':status,'token':''}):
+            reconciled = self.app.reconcile(task['id'])
+        install.assert_called_once()
+        self.assertEqual(reconciled['runner_id'], row['id'])
+        self.assertEqual(reconciled['state'], 'ready')
+        self.assertEqual(len(self.app.runners()), 1)
+        self.assertEqual(self.app.runners()[0]['error'], '')
+
+    def test_redeploy_automatically_finishes_interrupted_container_migration(self):
+        row = self.app.runners()[0]
+        profile = self.app.profiles[0]
+        profile['mode'] = 'session'
+        self.app.machine_inventory[profile['id']] = {'containers':[{'name':'replacement'}], 'images':[]}
+        self.app.transport.sessions[profile['id']] = unittest.mock.MagicMock()
+        old = {'id':'old-interrupted','runner_id':row['id'],'spec':row['spec'],'state':'unknown'}
+        self.app.store.save('deployment',old)
+        body = {'profile_id':profile['id'],'container':'replacement','container_mode':'existing','base':row['spec']['base'],'port':row['spec']['port'],'release_previous':True,'previous_runner_id':row['id']}
+        with patch.object(self.app.executor,'submit'):
+            task = self.app.deploy(body)
+        self.assertEqual(task['runner_id'],row['id'])
+        self.assertEqual(task['supersedes'],[old['id']])
+        status = {**row['status'],'container':'replacement','root':row['spec']['base']}
+        self.app.demo = False
+        with patch.object(self.app.transport,'deploy',return_value={'status':status,'token':''}), patch.object(self.app,'reconcile',side_effect=AssertionError('manual reconcile must not be required')):
+            self.app.worker(task)
+        self.assertEqual(task['state'],'ready')
+        self.assertEqual(self.app.store.get('deployment',old['id'])['superseded_by'],task['id'])
+        self.assertEqual(len(self.app.runners()),1)
+        self.assertEqual(self.app.runners()[0]['spec']['container'],'replacement')
+
+    def test_stopped_or_deleted_old_container_can_be_replaced_without_manual_unlock(self):
+        row = self.app.runners()[0]
+        profile = self.app.profiles[0]
+        profile['mode'] = 'session'
+        self.app.machine_inventory[profile['id']] = {'containers':[{'name':'replacement'}], 'images':[]}
+        session = unittest.mock.MagicMock()
+        self.app.transport.sessions[profile['id']] = session
+        body = {'profile_id':profile['id'],'container':'replacement','base':row['spec']['base'],'port':row['spec']['port'],'release_previous':True,'previous_runner_id':row['id']}
+        for reason in ('stopped','deleted','active'):
+            with self.subTest(reason=reason):
+                self.app.store.claim(row['id'],'model:8000','old-request')
+                session.execute.return_value=json.dumps({'retired':reason!='active','reason':reason})
+                with patch.object(self.app.executor,'submit'):
+                    if reason=='active':
+                        with self.assertRaisesRegex(ValueError,'有测试'):
+                            self.app.deploy(body)
+                        self.assertEqual(self.app.store.request_for(row['id']),'old-request')
+                        self.app.store.release(row['id'],'old-request')
+                    else:
+                        task=self.app.deploy(body)
+                        self.assertIsNone(self.app.store.request_for(row['id']))
+                        task['state']='failed'
+                        self.app.store.save('deployment',task)
+
+    def test_persistent_connection_recovers_automatically_inside_deployment(self):
+        from .transport import AccessPendingError
+        row=self.app.runners()[0]
+        self.app.demo=False
+        task={'id':'auto-connect','runner_id':row['id'],'spec':row['spec'],'state':'queued','logs':'','created_at':0}
+        result={'status':row['status'],'token':''}
+        with patch.object(self.app.transport,'deploy',side_effect=AccessPendingError('temporary disconnect',result)), patch.object(self.app.transport,'session'), patch.object(self.app.transport.channels,'install',side_effect=[ValueError('temporary'),None]) as install, patch.object(self.app.transport,'status',return_value=result), patch('fleet.app.time.sleep'):
+            self.app.worker(task)
+        self.assertEqual(install.call_count,2)
+        self.assertEqual(task['state'],'ready')
+        self.assertEqual(self.app.runners()[0]['error'],'')
 
     def test_network_allowlist_is_enforced_before_public_pages(self):
         import ipaddress

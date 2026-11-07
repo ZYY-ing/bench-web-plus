@@ -1,198 +1,198 @@
-# Bench Web Plus · 共享中心预览版
+# Bench Web Plus · 共享评测中心
 
-共享中心预览版本为 **v0.2.0-preview.1**。建议在新目录部署验证；v0.1.1 为历史本机版。
+一个中心统一管理多台 Linux Docker Runner。管理员通过浏览器接入服务器、安装 Runner；用户通过同一 HTTPS 网址选择 Runner，评测已有的 OpenAI 兼容模型服务。
 
-**团队只部署一个中心，安装在一台常开个人电脑上。其他管理员和普通用户只用浏览器。** 同一网址默认进入免登录用户界面，管理员点击登录入口，用各自账号和密码进入管理页。
+**新部署请使用当前 `main` 的完整源码。旧 Release 是历史快照，不包含本次会话的全部修复。** 中心无需 Node.js、前端编译、Docker 或 NPU；其他管理员与用户的电脑仅需浏览器。
 
-新版本的安装、后台运行、证书、允许网段、多管理员和服务器接入教程，请看 **[共享中心部署说明](docs/SHARED_CENTER.md)**。
+- [中心部署详细说明](docs/SHARED_CENTER.md) · [首次部署排障](docs/CENTER_TROUBLESHOOTING.md)
+- [本次完整会话交接与当前行为](docs/SESSION_HANDOFF_20261107.md) · [历史交接入口](docs/HANDOFF.md)
+- [匿名化工具与原生 AISBench 对照实验](docs/experiments/2026-11-07-aisbench-tool-native-ab.md)
 
-- **[下载共享中心安装包](https://github.com/ZYY-ing/bench-web-plus/releases/download/v0.2.0-preview.1/bench-web-plus-shared-preview.zip)**（约7.5 MB；不含 Python、模型和全部离线依赖）。
-- [下载 SHA256 校验文件](https://github.com/ZYY-ing/bench-web-plus/releases/download/v0.2.0-preview.1/bench-web-plus-shared-preview.zip.sha256)。
-- [首次部署问题与重新配置](docs/CENTER_TROUBLESHOOTING.md) · [共享中心交接记录](docs/SHARED_HANDOFF.md)。
+## 工作方式
 
-新电脑先安装 Python 3.12+，再双击 `setup-shared-center.cmd`。Python 下载、PATH、证书、内外网依赖和允许网段步骤见[部署说明](docs/SHARED_CENTER.md)。
+```text
+管理员 / 用户浏览器 → HTTPS 中心 → 受限 TLS API → Runner
+                         │                     └→ AISBench → 模型服务
+                         └→ SSH：安装、维护、自动恢复
+```
 
-以下保留 v0.1.1 历史说明，仅作兼容回溯；与新说明不同的地方，以共享中心部署说明为准。
+中心不逐条代理模型推理请求。Runner 在服务器 CPU 上准备数据、启动 AISBench、收集日志与结果；模型服务独立运行，可以在另一台可达的机器。工具不会自动启动 vLLM，也不下载模型权重。
 
-## 历史版本：v0.1.1 本机版
+团队通常部署一个中心。其他电脑打开同一个网址即使用同一清单和授权，无需重复输入服务器密码；另行部署第二个中心不会自动继承原中心数据和权限。
 
-基于 [ascend-bench-web](https://github.com/ZYY-ing/ascend-bench-web) 的多机 Runner 网页管理与模型评测工具。
+## 代码仓结构
 
-管理员在网页连接服务器、选择容器、一键安装或接回 Runner；用户选择健康空闲的 Runner，配置已有 vLLM 服务，进行精度或性能测试。无需前端编译，不下载模型权重，不自动启动 vLLM。
-
-当前版本是**本机控制台**：管理页和用户页分开，中心只监听 `127.0.0.1`。其他电脑可下载工具独立部署；尚不支持一个中心开放给多台电脑直接访问，也没有普通用户账号和结果隔离。
-
-## 下载
-
-- **推荐：[下载完整工具包](https://github.com/ZYY-ing/bench-web-plus/releases/latest/download/ascend-bench-fleet-v1-local.zip)**，解压即可启动，不需要 Git 或 Node.js。
-- [发行版与 SHA256](https://github.com/ZYY-ing/bench-web-plus/releases/latest)：同一版本提供 ZIP、Runner 压缩包和校验文件。
-- GitHub 页面选择 Code → Download ZIP，或 [下载 main 源码 ZIP](https://github.com/ZYY-ing/bench-web-plus/archive/refs/heads/main.zip)。源码内自带 Runner 压缩包，无需重新构建。
-
-源码包约 7–8 MB，管理员 SSH 组件和服务器 AISBench 依赖在首次安装时另行下载，体积会明显更大。仓库不包含模型、服务器配置、管理员 token、运行数据库或测试结果。
-
-## 安装前准备
-
-| 位置 | 需要什么 |
+| 路径 | 用途 |
 |---|---|
-| 管理员电脑 | Python **3.12+**（包含 pip）、现代浏览器、可以连接目标服务器 SSH；Windows / Linux 启动脚本均提供 |
-| 目标 Linux 服务器 | Docker、Python 3、SSH 账号及相应 Docker 权限；已有兼容本地镜像或测试容器 |
-| 测试容器 | host 网络、Python 3.12+、Bash、curl、专用持久化 RW 目录；可读的 tokenizer / 数据目录 |
-| 模型推理服务 | 已独立启动的 vLLM OpenAI 兼容服务，`/health` 和 `/v1/models` 正常 |
-| 同一电脑的普通用户 | 只需要浏览器，无需管理员凭据、服务器密码、Python 或本地 Docker |
+| `fleet/app.py`、`http_server.py` | 中心 API、用户会话、占用与任务调度 |
+| `fleet/accounts.py`、`admin.py`、`configure.py` | 管理员账号、首次 HTTPS 与网段配置 |
+| `fleet/service.py`、`setup_shared.py` | Windows 后台任务、开机服务、安装向导 |
+| `fleet/static/` | 管理页、Runner 列表、存储清理界面 |
+| `fleet/session_ssh.py`、`managed_ssh.py`、`management_host.py` | 首次 SSH 授权、后续受控维护、分块传输 |
+| `fleet/persistent*.py`、`gateway.py`、`recovery*.py` | 受限 TLS 评测通道、断线恢复及服务器恢复服务 |
+| `fleet/direct_worker.py`、`replacement.py`、`pip_trust.py` | Runner 安装、停止旧容器后的迁移、包源与 CA 检查 |
+| `fleet/dataset_request.py`、`storage_cleanup.py` | 生成任务与服务互锁、管理员手动清理 |
+| `fleet/runner-overlay/scripts/` | Runner、数据生成、缓存锁、运行时适配、日志读取与远端清理源码 |
+| `fleet/runner-overlay/website/` | 精度、性能、执行结果与测试记录页面 |
+| `fleet/runner-overlay/wheels/` | 少量固定依赖 wheel；不是完整离线环境 |
+| `dist/ascend-bench-fleet-kit.tar.gz` 与 `.sha256` | 网页部署实际上传的固定 Runner 包及校验文件；包含固定 AISBench 源码和基础数据 |
+| `fleet/build_kit.py`、`package.py` | 重建 Runner 包、生成完整中心 ZIP |
+| `fleet/test_*.py`、`fleet/test_*.cjs` | 本地回归测试，不连接生产模型服务 |
+| `docs/` | 部署、交接、验收与实验记录 |
 
-管理员电脑不需要 Codex、Node.js、前端构建工具、Docker、vLLM 或 NPU 驱动。Runner 可与 vLLM 位于不同容器，但必须能访问推理服务和测试所需 tokenizer。只挂 tokenizer 即可，不必下载整份权重到电脑。
+运行后才生成的 `.fleet-data/`、`.fleet-deps/`、`fleet-config.json` 不属于源码。前者可能包含数据库、证书与加密授权，不能上传或分发。机器专用维护脚本、测试输出和原始归档不随源码发布。
 
-## 管理员部署教程
+## 新机器部署中心（Windows）
 
-### 1. 下载并启动本机中心
+### 1. 准备环境并下载当前源码
 
-解压到有写权限的独立目录，不要覆盖正在运行的旧目录。
+安装完整 Python **3.12+**（包含 pip），确认 `python --version` 与 `python -m pip --version` 正常；不要使用 Windows 商店占位入口。当前共享中心与 Windows 无人登录开机方案有实机使用记录；其他系统不要直接照搬 Windows 服务步骤。
 
-Windows：双击 `start-fleet.cmd`，或在 PowerShell 中运行：
-
-```powershell
-.\start-fleet.cmd
-```
-
-Linux / macOS（提供脚本，实机验收环境见交接文档）：
-
-```bash
-bash start-fleet.sh
-```
-
-脚本首次把 `paramiko==5.1.0` 及其依赖装入当前目录 `.fleet-deps/`，不修改系统 Python。保持进程运行，浏览器打开：
-
-- 管理员：<http://127.0.0.1:19881/>
-- 用户：<http://127.0.0.1:19881/workbench/>
-
-首次启动生成 `.fleet-data/console-token`。用文本编辑器打开，复制**文件里的完整字符串**到管理员登录框；不是填写文件路径。不要把管理员 token 交给普通用户。
-
-需要更换本机端口：`start-fleet.cmd --port 19882` 或 `bash start-fleet.sh --port 19882`。指定 Python 可设置 `FLEET_PYTHON` 为解释器路径。
-
-### 2. 网页连接服务器并部署 Runner
-
-1. 点击「部署 Runner」，输入服务器 SSH 地址、端口、账号和本次密码。先核对服务器公钥指纹，首次确认后固定校验。密码仅用于内存会话，不保存到配置、日志或数据库；不读取个人 SSH 私钥或 ssh-agent。
-2. 选择已有容器，或使用服务器**已有本地镜像**创建独立测试容器。新容器不带 NPU、不开 privileged、不拉镜像，也不启动模型服务。
-3. 填专用持久化安装目录和 Runner 端口（默认 `18787`）。示例目录 `/home/ascend_bench/runner`；安装包缓存示例 `/mnt/share/ascend_bench/packages`。管理员需改成自己有权限使用的专用目录。
-4. 外网环境保持「安装网络」为空；内网环境按下一节填写代理 / pip 源。
-5. 点击「部署并启动」，观察日志与六步进度。工具自动校验缓存 SHA256，相同则上传 0 B，否则从电脑上传当前固定版本并校验；服务器无需从 GitHub 下载工具包。
-6. 检查已安装版本：最新版已运行则复用，最新版未运行则启动；旧版只在身份核实、空闲且确认无测试进程时更新。启动所选停止容器会执行它原有启动命令。网络、挂载、端口不满足条件时停止并说明原因。
-7. 六步绿色对勾表示部署完成。管理员测试环境卡片分别显示「SSH 管理通道」与「Runner 服务」状态，二者不是同一状态。
-
-**网页模式无需手工建立 SSH 隧道，也无需用户输入 `runner-token`。** 中心通过已认证 SSH 会话转发请求；关闭中心或失去 SSH 会话后，管理员需重新连接。历史日志保留当时原文，新版安装日志会给出当前网页步骤。
-
-「删除」只移除接入记录，不停止远端 Runner、不删除容器、文件或结果。用户列表与管理员当前测试环境一致；失败部署仅留在管理端部署记录，不会从历史中重新补回用户列表。仍登记但连接不可用的 Runner 保留显示且不可选择。
-
-### 3. 内网 / 外网：下载与依赖安装
-
-有两段独立网络：**电脑下载中心及 SSH 组件**，以及**服务器容器下载 AISBench 依赖**。给电脑设置代理不会自动给服务器提供可达的代理。
-
-#### 外网可直连
-
-直接下载 ZIP 并运行启动脚本。管理员组件由 pip 当前默认源下载；服务器 AISBench 默认使用 `https://mirrors.aliyun.com/pypi/simple`，也可在网页填写可达的 HTTPS 源。
-
-#### 电脑只能通过代理下载
-
-也可以在可联网电脑下载 ZIP 后拷贝过来。PowerShell 下载示例：
+有 Git：
 
 ```powershell
-$benchProxy = 'http://127.0.0.1:7897' # 替换为电脑自己的代理
-curl.exe --proxy $benchProxy -fL 'https://github.com/ZYY-ing/bench-web-plus/releases/latest/download/ascend-bench-fleet-v1-local.zip' -o bench-web-plus.zip
-# 首次安装本机 SSH 组件，可选其一或按网络同时配置：
-$env:HTTPS_PROXY = $benchProxy
-$env:PIP_INDEX_URL = 'https://pypi.org/simple' # 或电脑可达的内网 pip 源
-.\start-fleet.cmd
+git clone https://github.com/ZYY-ing/bench-web-plus.git
+cd bench-web-plus
 ```
 
-Bash 对应方式：
+无 Git：下载 [main 源码 ZIP](https://github.com/ZYY-ing/bench-web-plus/archive/refs/heads/main.zip)，解压到有写权限的独立目录。源码已含 Runner 包，**普通部署无需自行构建**。
 
-```bash
-export HTTPS_PROXY=http://127.0.0.1:7897 # 替换为电脑自己的代理
-export PIP_INDEX_URL=https://pypi.org/simple
-curl --proxy "$HTTPS_PROXY" -fL https://github.com/ZYY-ing/bench-web-plus/releases/latest/download/ascend-bench-fleet-v1-local.zip -o bench-web-plus.zip
-# 解压、进入目录后：
-bash start-fleet.sh
+只有中心电脑安装 Python。需要中心到服务器 SSH 和受限 TLS 端口可达、用户浏览器到中心 HTTPS 端口可达，Runner 到模型 HTTP 接口可达。
+
+### 2. 首次配置
+
+在工具目录运行：
+
+```powershell
+.\setup-shared-center.cmd
 ```
 
-GitHub 页面不可用、但源码下载域名可达时，可下载整个源码 ZIP：
+向导安装固定 SSH 依赖到 `.fleet-deps/`，依次填写中心固定 HTTPS 地址、允许访问的用户 CIDR 网段、首个管理员账号及密码、已有可信证书或测试证书，然后创建并启动当前用户登录后台任务。
 
-```bash
-curl -fL https://codeload.github.com/ZYY-ing/bench-web-plus/zip/refs/heads/main -o bench-web-plus-source.zip
+示例网址 `https://192.0.2.10:19885`、网段 `192.0.2.0/24` 仅用于说明，必须改成实际地址。中心地址不要填用户电脑自己的 `127.0.0.1`。密码交互输入时不显示字符；不应放在命令参数里。
+
+没有 `py` 启动器时，可指定真实 Python 路径：
+
+```powershell
+$env:FLEET_PYTHON = 'C:\Path\To\Python\python.exe'
+& $env:FLEET_PYTHON --version
+.\setup-shared-center.cmd
 ```
 
-Runner 压缩包还提供 [jsDelivr 备用地址](https://cdn.jsdelivr.net/gh/ZYY-ing/bench-web-plus@main/dist/ascend-bench-fleet-kit.tar.gz)，但它**不是完整管理员工具包**；CDN 可能延迟，不用它判断 GitHub 是否已发布。
+PowerShell 执行引号中的程序路径必须在前面加 `&`；设置环境变量不会让不存在的 `py` 命令变可用。
 
-若管理员电脑使用 HTTP 内网 pip 源，还需设置 `PIP_TRUSTED_HOST` 为该源域名；优先使用可信 HTTPS 源。这是电脑侧 pip 设置，与网页中的服务器安装网络设置分别生效。
+由有权限者仅向所需用户网段放行中心端口。使用测试证书时，访问电脑信任 `.fleet-data/tls/ca.pem` 公钥证书；不分发私钥，不跳过 TLS 校验。中心电脑需联网、不休眠。
 
-企业网络需要自签 CA 时，由管理员将可信 CA 配到电脑 / 容器，电脑 pip 可用 `PIP_CERT`、curl 可用 `--cacert`。本教程不要求关闭 TLS 验证。
+### 3. 需要无人登录 Windows 也运行
 
-#### 服务器只能访问内网代理 / 内网 pip 源
+首次向导默认是“用户登录后启动”，锁屏可以运行，注销后不能保证运行。需要开机即运行时：
 
-在部署向导的「安装网络」展开填写：
+```powershell
+& $env:FLEET_PYTHON -X utf8 -m fleet.service stop
+```
 
-| 网页字段 | 例子（请替换） | 对应原版变量 |
+确认中心正常停止后，**以 Windows 管理员身份**从同一个源码目录运行 `install-center-autostart.cmd`。也可以在已提升权限的 PowerShell 执行：
+
+```powershell
+& $env:FLEET_PYTHON -X utf8 -m fleet.service install-boot
+& $env:FLEET_PYTHON -X utf8 -m fleet.service status --boot
+```
+
+安装器将代码、Python 与中心数据复制到受保护的 `%ProgramData%\BenchWebPlus`，由 SYSTEM 开机运行，不保存 Windows 密码。成功后运行数据位于受保护副本，原源码目录的数据不再是运行中的数据源。
+
+维护开机任务，使用管理员 PowerShell：
+
+```powershell
+& $env:FLEET_PYTHON -X utf8 -m fleet.service status --boot
+& $env:FLEET_PYTHON -X utf8 -m fleet.service stop --boot
+& $env:FLEET_PYTHON -X utf8 -m fleet.service start --boot
+```
+
+未安装开机任务时去掉 `--boot`。前台启动的中心用原窗口 Ctrl+C 停止。不要同时启动前台、登录任务和开机任务的多个中心；端口未释放时先核对旧实例，不结束未知进程。
+
+### 4. 首次验证
+
+另一台电脑打开设置的网址，确认默认用户页可访问；管理员登录后部署一个专用 Runner，退出管理员再验证用户选择 Runner。不要仅以“计划任务创建成功”判断端口、证书、服务器接入全部成功。
+
+## 管理员使用
+
+1. 登录管理页，点击部署 Runner，填写 SSH 地址、端口、账号及本次密码，核对主机指纹。保留“首次授权后自动管理”和“受限持久连接”，完成工具专用密钥授权。
+2. 选择已有测试容器，或用服务器已有本地镜像新建容器。新建容器不挂 NPU、不启用 privileged、不拉镜像、不启动模型。选择停止的已有容器会执行其原有启动命令，应先确认它是可操作的测试容器。
+3. 填专用安装路径、Runner 端口、受限连接端口与安装包缓存目录。新容器默认只读挂载宿主机 `/mnt`、`/home`，安装目录另行可写挂载；已有容器不能自动补挂载。
+4. 按需要填服务器可达的代理、pip 源及可信 CA。中心电脑的代理不等于服务器代理；证书失败应修复 CA/包源，不关闭 HTTPS 校验。服务器首次缺依赖时仍需可用的依赖来源。
+5. 提交后观察部署日志。程序检查实际容器、目录、端口、AISBench 可执行性与版本；相同包缓存命中不重复上传，缺失时分块上传并校验。不会每次从 GitHub 拉取未知版本。
+6. 部署成功后清单持久保留，关闭管理员网页不会断开后台连接。首次授权后 SSH 自动重连、中心启动后恢复管理连接；服务器恢复还依赖容器及独立恢复服务正常。主动停止的外部容器不会被擅自启动。
+
+同机只保留一个 Runner，换容器时先手动停止**专用旧 Runner 容器**，再选择新容器复用路径和端口。程序确认旧容器停止/删除、端口无未知监听后迁移；失败时回退程序和配置，旧容器保持停止。不要停止带有他人模型服务的容器。
+
+同机多个 Runner 必须使用不同 Runner 端口、受限连接端口及独立持久目录；路径别名映射到同一宿主目录也会被检查。多 Runner 共享 CPU、内存、网络，不是性能隔离。
+
+“删除接入记录”不等于卸载容器、销毁密钥或删除远端文件。账号管理支持添加、停用和重置管理员。忘记密码时在中心所在环境交互运行 `python -m fleet.admin reset <账号>`，不要重新初始化已有数据。
+
+### 手动清理存储
+
+管理页点击清理，填写保留天数（1–3650，默认 7），扫描所有登记 Runner，查看路径、名称、大小，默认全选后可取消勾选再清理：
+
+- 性能缓存范围 `datasets/perf/`，最近生成/校验复用会更新 `.last-used`；正在生成、被任务引用或占用未确认释放的缓存跳过。
+- 任务范围 `results/jobs/real-*`，删除的是整个任务目录。按任务结束时间与目录内最新修改时间中的较新者判断，运行中不删除，查看/下载不续期。
+- 执行删除前重新验证状态、签名和目录指纹。忙碌、SSH 断开、Runner 不可用或文件已变化时拒绝/跳过并报告；不绕过锁清理。
+- 删除结果后对应记录从测试记录页消失。没有每日自动清理，也不另存轻量历史摘要；需要的结果先下载另存。旧环境、备份、模型及任意非正式目录不在此按钮的通用清理范围。
+
+## 用户使用与生成内容
+
+1. 打开中心网址，进入精度或性能。刷新列表，选择健康空闲 Runner 并确认；提交时还会重新核验，刷新时的空闲不是资源预留。
+2. 填目标模型服务 IP/Host、端口、`served-model-name` 与 Runner 可读取的 tokenizer 路径，检查连接。允许跨机器测试，以实际 HTTP 可达性为准，不以 ping 代替接口检查。
+3. 精度选择 GSM8K、GPQA Diamond 或 AIME2026；性能填写输入 token 长度、请求数、输出长度、随机种子及共享前缀比例，再生成或复用数据集。大数据生成有异步进度，不能仅凭列表“数据准备中”判断卡死。
+4. 配置并发、温度、最大输出、接口 Chat/Completions、流式、ignore_eos、预热、超时与 retry。预热输出默认跟随正式最大输出，可单独改；预热不计入正式指标。最大输出可填到 225280 tokens（220 Ki），并发可填 1000，实际承载能力由模型服务与资源决定，支持填写不代表已实测该规模。
+5. 精度仅提供 `all`，性能仅提供 `perf`。`perf` 配合额外参数 `reuse` 时，保留 AISBench 原生转为结果可视化的行为；不能在额外参数中重新覆盖 mode。
+6. 点击测试，查看统一执行日志、真实配置、命令和原生结果。任务成功/失败后，确认进程组退出即自动恢复空闲；仍有活跃进程或状态未知时保留占用。
+7. 在测试记录查看并下载结果。完整日志在 Runner，不受网页日志尾部显示上限影响；原生 ASCII 表格在比例字体编辑器中可能错位，可查原生 CSV/HTML 等文件。
+
+| 功能 | 生成/保留什么 |
+|---|---|
+| 性能数据集 | `data.jsonl`、manifest 与缓存校验信息；同目录写入互锁，tokenizer 只读不加锁 |
+| 每次正式任务 | 独立任务目录、`record.json`、`config.py`、真实命令、含运行环境的 `run.sh`、`execution.log`、AISBench 原生输出 |
+| 精度 | 预测、失败请求、评分与 summary（以原生任务实际产出为准） |
+| 性能 | 原生性能表、逐请求详情、图表及可用稳态结果（以实际产出为准） |
+| 状态/测试记录 | Runner 与目标服务信息、原生退出状态、提示及文件索引；普通用户之间没有结果隐私隔离 |
+
+### 参数规则
+
+额外参数用逗号分隔的 `参数名=值`。网页已出现的温度、并发、输出、超时、预热等直接在表单填，不在额外参数重复配置。“格式与支持参数”动态列出三类完整名单：
+
+| 类别 | 例子 | 生效位置 |
 |---|---|---|
-| 服务器安装代理 | `http://proxy.example:3128` | `ASCEND_BENCH_PROXY` |
-| 服务器 pip 源 | `https://mirror.example/simple` | `ASCEND_BENCH_PIP_INDEX` |
-| 内网源域名映射，可选 | `192.0.2.10 mirror.example` | `ASCEND_BENCH_EXTRA_HOSTS` |
+| 模型配置 | `request_rate=2`、`trust_remote_code=false` | `models[0]` 顶层 |
+| 生成参数 | `top_p=0.95,top_k=20`、`skip_special_tokens=true` | `models[0].generation_kwargs` |
+| AISBench 执行参数 | `debug=false,max_num_workers=2`、`reuse="YYYYMMDD_HHMMSS"` | 对应 CLI 参数 |
 
-必须是**从服务器可达**的代理。服务器上的 `127.0.0.1` 指服务器自身，不能照抄电脑代理地址。地址不接受账号密码、查询参数或令牌；需要认证的源请由管理员预先在受保护环境配置。
+若有其他未收录的**生成参数**，填 `generation_kwargs.参数名=JSON值`，如 `generation_kwargs.reasoning_effort="low"`；是否支持由目标模型服务决定。该前缀不用于任意新增模型顶层参数或命令行选项，不支持任意 Python 代码。两种别名不能重复配置；debug 开启时遵循原生单 worker 行为。
 
-沿用原版安装能力：HTTP 内网 pip 源可用并仅对该源设置 trusted-host；优先选择可用的 HTTPS 源。可选域名映射会写入**所选容器** `/etc/hosts`，不改宿主机 hosts；不需要就留空。
+请求超时默认使用 AISBench 原生不限时，也可自定义秒数；`retry` 原值透传，不加一转换。`max_model_len` 遵循 AISBench/服务原生规则，工具不额外截断、填充精度题目或增加上下文拦截。
 
-源码包通过 SSH 上传，因此服务器无需访问 GitHub。首次缺少的 Python 依赖仍要能访问所填 pip 源；无法访问时会如实失败，不会把 Runner 接入成功当成模型测试成功。
+性能“稳态指标”使用原生稳态算法，样本/并发时间形态不足可能无法形成稳态窗口；“pressure”按时长持续发请求，实际请求数可超过数据集条数。两者独立配置，不保证打开就一定能产生稳态统计。
 
-#### 完全离线
+任务状态遵循 AISBench 原生退出结果；失败请求、缺少评分或长度差异另外提示，不修改原生指标，不因期望长度与服务统计略有不同自行判失败。复核应同时查看退出码、失败文件和原生结果，不能仅看页面“完成”。
 
-在**系统、架构和 Python 版本与管理员电脑相同**的联网环境下载 SSH 依赖：
+共享前缀缓存复用还取决于输入/输出长度、条目数、种子、前缀比例、接口、tokenizer 指纹及缓存版本；只匹配文件夹名不足以复用。不同 Runner 只读同一 tokenizer 不互锁；共用缓存的写入会互锁。同一 Runner 的生成与测试互斥，同一中心对同一模型服务的生成/测试按占用规则拒绝冲突，不会替你探测和阻止所有外部 AISBench 客户端。
 
-```bash
-python -m pip download -r requirements-admin.txt -d wheelhouse-admin
+## 更新、构建与验证
+
+新中心从空配置开始，不携带本仓库作者的服务器授权。已有中心更新前备份真实运行数据目录；Windows DPAPI 加密授权不能简单复制到另一台电脑当作已授权。
+
+普通后台中心先正常停止、更新源码与 `dist/`、保留数据，再启动。SYSTEM 开机中心先以管理员权限正常停止 `fleet.service stop --boot`，然后从原安装源目录重新运行开机安装器；更新时保留受保护副本现有账号与授权。仅更新工作区文件不会更新已经复制到 ProgramData 的运行中心。
+
+中心更新不等于远端所有 Runner 已更新。对空闲 Runner 从管理页按已有容器重新部署，核验目标版本；正在执行任务的 Runner 待任务结束后更新，不强制重启。无需每个用户手动配参数或重新安装 Python。
+
+开发/发布验证（Node 仅用于开发测试）：
+
+```powershell
+python -m fleet.build_kit
+python -m unittest discover -s fleet -t . -p 'test_*.py'
+Get-ChildItem fleet -Filter 'test_*.cjs' | ForEach-Object { node $_.FullName; if ($LASTEXITCODE) { throw "前端测试失败" } }
+python -m fleet.package --name bench-web-plus-shared-current.zip
 ```
 
-将工具包和 wheelhouse 拷到离线电脑，在工具目录执行：
+`build_kit` 将本地审阅过的 overlay 覆盖到固定包，不在线抓取上游 main；wheel 保持二进制原样。当前 Runner 压缩包约 39 MB，主要包含固定 AISBench 源码、基础数据和少量兼容依赖，不含模型与完整 Python/torch 环境，不能按历史 7 MB 描述。
 
-```bash
-python -m pip install --no-index --find-links wheelhouse-admin --target .fleet-deps -r requirements-admin.txt
-```
-
-然后正常启动。不要把 Windows wheels 用到 Linux，也不要跨 CPU 架构复制虚拟环境。
-
-服务器必须已有可执行 AISBench 环境，或由管理员用与目标容器匹配的离线 wheels 预先安装到 `<Runner目录>/bench-venv`。默认位置 `<Runner目录>/bench-venv/bin/ais_bench` 可复用。**首次没有 AISBench、也没有依赖源 / 离线依赖时，不能完成安装**；源码包不捆绑全部评测依赖和镜像。
-
-## 用户使用教程
-
-1. 管理员在这台电脑启动中心、接入服务器后，打开 <http://127.0.0.1:19881/workbench/>。用户无需管理员 token 或 SSH 密码。
-2. 在精度 / 性能页点击「刷新状态」，选择健康空闲 Runner，再点「使用所选 Runner」。列表显示地址、容器名；忙碌节点显示正在测试的 `IP:port` 和 `model_name`，不可用节点仍显示但不可选。
-3. 填推理服务地址、端口、模型名（`/v1/models` 返回的 id）、Runner 容器能读到的 tokenizer 路径，点击「检查连接」。Runner 安装不会替你启动 vLLM。
-4. 选择数据集，配置样本数 / 并发 / 输出长度，开始测试。确认 Runner 前后续步骤不可操作；后端也校验刷新与选择状态。
-5. 「测试记录」查看和下载服务器真实结果，不再显示 Runner 选择步骤。记录属于 Runner 项目，尚无普通用户间结果隔离。
-
-### 在另一台电脑使用
-
-当前 `127.0.0.1` 永远指访问者自己的电脑。另一台电脑需要下载本工具、安装 Python，由管理员在该电脑启动中心并完成服务器接入；之后该电脑的用户只用浏览器。各电脑中心的接入清单和锁不共享，不能把它们当一个统一调度中心；同一个 Runner 的执行锁仍在远端生效。
-
-如果希望「管理员部署一处，其他电脑只打开一个共享网址」，本版本尚未实现；需要另做 HTTPS、用户认证和访问控制。不要直接修改为 `0.0.0.0` 暴露当前管理端。
-
-## 更新与排错
-
-- 更新：停止本机中心，备份本机 `.fleet-data/` 和 `fleet-config.json`，用新工具包更新源码 / `dist/`，保留数据目录，再启动并重新连接 SSH。数据备份含管理员凭据，只能保存在受保护位置。
-- 「最新版」以电脑下载的这份固定工具包为准，不自动执行 GitHub main 中未知更新。更新电脑工具包后，再从网页更新远端 Runner。
-- 两个 host 网络容器在同一服务器共用端口；需要并行运行时使用不同 Runner 端口和独立持久化目录。
-- 换容器复用原目录：当前启动容器名优先于旧配置；保留服务参数和结果。迁移已运行旧进程需核实 PID、命令、工作目录、启动环境及监听 socket 归属，且空闲并确认无测试进程。未知服务不会被停止。
-- `TIME_WAIT` 退出残留允许正常地址复用，仍用原端口。真实监听冲突会报错，不自动换端口，不杀未知进程。
-- SSH 已连接但 Runner 不可用：表示管理通道正常、Runner 服务异常，检查对应容器 / 项目 / 端口和具体错误。
-- 退出管理员后管理按钮隐藏，部署进度轮询停止；用户会话没有部署和连接机器权限。
-
-## 源码与验证
-
-```bash
-python -m fleet.build_kit  # 仅修改 Runner 源码后需要；下载使用不必执行
-python -m unittest fleet.test_fleet
-node fleet/test_picker.cjs # 开发验证可选；使用产品不需要 Node
-python -m fleet.package
-```
-
-主要代码在 `fleet/`，内置 Runner 在 `dist/ascend-bench-fleet-kit.tar.gz`，补丁源码在 `fleet/runner-overlay/`。构建基于随仓库固定工具包覆盖补丁，不临时抓取上游 main。保留了旧接入实验的源码供回溯，默认网页只使用密码内存会话流程。
-
-[脱敏会话交接文档](docs/HANDOFF.md)说明真实验收范围和已知限制。Runner 可用不代表 vLLM 模型可用，本仓库不宣称已经完成模型精度 / 性能验收。
+内网/离线的中心依赖准备、服务器 CA 和恢复边界见[部署说明](docs/SHARED_CENTER.md)。包源不可达、镜像 Python 不兼容、模型上下文不足等仍会如实失败，部署成功也不等于任意模型与所有参数组合都已验收。

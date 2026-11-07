@@ -18,6 +18,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def validate_service_endpoint(service):
+    if not isinstance(service, dict):
+        raise ValueError('服务配置需要 JSON 对象')
+    host, port = service.get('host'), service.get('port')
+    if not isinstance(host, str) or len(host) > 253 or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]*', host):
+        raise ValueError('服务地址请填写纯 IP 或主机名，不含协议、路径或端口')
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError('服务端口范围为1–65535')
+
+
 def validate_request(request, spec):
     method, path, body = request.get('method'), request.get('path'), request.get('body')
     allowed = (method == 'GET' and (path in ('/api/status', '/api/info', '/api/config', '/api/jobs') or isinstance(path, str) and re.fullmatch(r'/api/jobs/real-[a-z0-9-]+', path))) or (
@@ -30,9 +40,7 @@ def validate_request(request, spec):
         raise ValueError('GET 请求不能包含 body')
     if method == 'POST' and path in ('/api/check-service', '/api/jobs'):
         service = body.get('service', {}) if path == '/api/check-service' else body
-        allowed_ports = spec.get('service_ports')
-        if not isinstance(service, dict) or service.get('host') not in spec['service_hosts'] or type(service.get('port')) is not int or not 1 <= service['port'] <= 65535 or allowed_ports is not None and service['port'] not in allowed_ports:
-            raise ValueError('服务端点不在安装时批准的清单中')
+        validate_service_endpoint(service)
         tokenizer = service.get('tokenizer_path', '')
         if not isinstance(tokenizer, str) or '..' in tokenizer.split('/') or not any(tokenizer.startswith(root.rstrip('/') + '/') or tokenizer == root for root in spec['tokenizer_roots']):
             raise ValueError('tokenizer 不在批准目录中')

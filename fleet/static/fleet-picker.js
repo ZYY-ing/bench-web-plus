@@ -1,23 +1,24 @@
 /* Explicit refresh and selection gate for the existing evaluation UI. */
 (()=>{
  const panel=document.getElementById('fleetPicker');if(!panel)return;
- const style=document.createElement('style');style.textContent='#fleetPicker button:disabled{opacity:.45;cursor:not-allowed}#fleetPicker select:disabled{background:#f5f6f8;color:#9299a5}';document.head.append(style);
+ const style=document.createElement('style');style.textContent='#fleetPicker button:disabled{opacity:.45;cursor:not-allowed}#fleetPicker select:disabled{background:#f5f6f8;color:#9299a5}body:has(#results:not([hidden])) #fleetPicker{display:none!important}';document.head.append(style);
  const current=location.pathname.match(/^\/r\/([a-f0-9]{16})\//)?.[1];
  const select=panel.querySelector('select'),message=panel.querySelector('[data-message]'),refresh=panel.querySelector('[data-refresh]'),use=panel.querySelector('[data-select]'),editor=document.getElementById('editor');
- let context, fresh=new Set(),freshUntil=0,busy=false,refreshing=false,expiry;
+ let context, fresh=new Set(),freshUntil=0,busy=false,refreshing=false,selecting=false,expiry;
  let ready;window.fleetReady=new Promise(resolve=>ready=resolve);window.fleetSelectionReady=false;
  function gate(enabled){window.fleetSelectionReady=enabled;if(editor){editor.inert=!enabled;editor.setAttribute('aria-disabled',String(!enabled))}window.dispatchEvent(new Event('fleet-selection-change'))}
  gate(false);
- async function request(path,body){const response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-CSRF-Token':context.csrf},body:body===undefined?undefined:JSON.stringify(body)});const result=await response.json();if(!response.ok)throw Error(result.error||'请求失败');return result}
- function healthy(r){const p=context.profiles.find(p=>p.id===r.spec.profile_id);return p?.connected&&!r.error&&r.status.activity==='idle'}
- function controls(){select.disabled=busy||refreshing;refresh.disabled=busy||refreshing;use.disabled=busy||refreshing||Date.now()>freshUntil||!fresh.has(select.value)||!context?.runners.some(r=>r.id===select.value&&healthy(r))}
- function availability(r){const p=context.profiles.find(p=>p.id===r.spec.profile_id);return !p?.connected?'管理连接未建立，请联系管理员':r.error?'Runner 不可用，请联系管理员':r.status.activity==='idle'?'健康 · 空闲':r.status.activity==='running'?'测试中':'准备中 / 状态待核对'}
+ async function request(path,body){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),20000);try{const response=await fetch(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-CSRF-Token':context.csrf},body:body===undefined?undefined:JSON.stringify(body),signal:controller.signal});const result=await response.json();if(!response.ok)throw Error(result.error||'请求失败');return result}catch(e){if(e.name==='AbortError')throw Error('状态确认超时，请刷新状态后重试。');if(e instanceof TypeError)throw Error('连接中心失败，请检查网络后重试。');throw e}finally{clearTimeout(timeout)}}
+ function reachable(r){const p=context.profiles.find(p=>p.id===r.spec.profile_id);return (r.access_configured||p?.connected)&&!r.error}
+ function healthy(r){return reachable(r)&&r.status.activity==='idle'}
+ function controls(){select.disabled=busy||selecting;refresh.disabled=busy||refreshing||selecting;use.disabled=busy||selecting||Date.now()>freshUntil||!fresh.has(select.value)||!context?.runners.some(r=>r.id===select.value&&healthy(r))}
+ function availability(r){const p=context.profiles.find(p=>p.id===r.spec.profile_id);return !(r.access_configured||p?.connected)?'管理连接未建立，请联系管理员':r.error?'Runner 不可用，请联系管理员':r.status.activity==='idle'?'健康 · 空闲':r.status.activity==='running'?'测试中':r.status.activity==='preparing'?(r.status.operation?.kind==='checking'?'连接检查中 · Runner 忙碌':'数据准备中 · 连接正常'):'状态待核对'}
  const unavailable=document.createElement('ul');unavailable.setAttribute('aria-label','不可用 Runner 列表');unavailable.className='hint';panel.append(unavailable);
  function draw(){
-  select.replaceChildren();const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent=!context.runners.length?'暂无已登记 Runner，请联系管理员':fresh.size?'请选择健康空闲的 Runner':'可查看全部 Runner；请先刷新状态再选择';select.append(placeholder);
+  const selected=select.value;select.replaceChildren();const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent=!context.runners.length?'暂无已登记 Runner，请联系管理员':fresh.size?'请选择健康空闲的 Runner':'可查看全部 Runner；请先刷新状态再选择';select.append(placeholder);
   for(const r of context.runners){const p=context.profiles.find(p=>p.id===r.spec.profile_id);const option=document.createElement('option');const target=r.status.active_job?.target;const task=target?' · 测试 '+(target.host||'?')+':'+(target.port||'?')+' · '+(target.model||'未提供模型名'):'';option.value=r.id;option.textContent=(p?.host||'')+':'+r.spec.port+' · 容器 '+r.spec.container+' · '+availability(r)+(r.status.activity!=='idle'?task:'');option.disabled=!fresh.has(r.id)||!healthy(r);select.append(option)}
   unavailable.replaceChildren();unavailable.hidden=!context.runners.length||context.runners.some(healthy);if(!unavailable.hidden){for(const r of context.runners){const p=context.profiles.find(p=>p.id===r.spec.profile_id),item=document.createElement('li');item.textContent=(p?.host||'')+':'+r.spec.port+' · 容器 '+r.spec.container+' · '+availability(r);unavailable.append(item)}}
-  controls();
+  if(context.runners.some(r=>r.id===selected))select.value=selected;controls();
  }
  if(!current){
   records=[];document.getElementById('count').textContent='0';document.querySelector('#history .muted').textContent='配置、实际命令、日志与结果保存在服务器';
@@ -34,14 +35,24 @@
  window.addEventListener('fleet-job-state',event=>{busy=event.detail.busy;controls()});
  select.onchange=()=>{gate(false);if(Date.now()>freshUntil){fresh.clear();message.textContent='状态已过期，请刷新后再选择。'}else message.textContent=select.value?'请点击“使用所选 Runner”确认，之后配置推理服务。':'请选择一个健康空闲的 Runner。';controls()};
  refresh.onclick=async()=>{
-  if(!context)return;refreshing=true;fresh.clear();gate(false);controls();message.textContent='正在刷新 Runner 状态…';let failed=0;
-  try{for(const r of context.runners){try{await request('/api/user/refresh',{runner_id:r.id});fresh.add(r.id)}catch(e){failed++}}context=await request('/api/user/bootstrap');freshUntil=Date.now()+60000;draw();message.textContent=context.runners.some(r=>fresh.has(r.id)&&healthy(r))?'状态已刷新，请选择健康空闲的 Runner。'+(failed?' 部分 Runner 连接不可用，请联系管理员。':''):'暂无健康空闲 Runner，请联系管理员检查连接。';clearTimeout(expiry);expiry=setTimeout(()=>{fresh.clear();controls();message.textContent=window.fleetSelectionReady?'当前 Runner 已选择；切换前请重新刷新状态。':'状态已过期，请刷新后再选择。'},60000)}catch(e){message.textContent=e.message}finally{refreshing=false;controls()}
+  if(!context||refreshing||busy||selecting)return;refreshing=true;fresh.clear();gate(false);controls();message.textContent='正在刷新 Runner 状态…';let failed=0;const infos=[];
+  try{
+   await Promise.allSettled(context.runners.map(async r=>{
+    try{const reply=await request('/api/user/refresh',{runner_id:r.id});if(reply.refresh_info)infos.push(reply.refresh_info);if(reply.runner)context.runners=context.runners.map(old=>old.id===r.id?reply.runner:old);fresh.add(r.id);freshUntil=Date.now()+60000}
+    catch(e){failed++;fresh.delete(r.id);r.error='连接暂不可用'}
+    draw();message.textContent=`已刷新 ${fresh.size} 个，${failed} 个不可用；在线空闲 Runner 可直接选择。`;
+   }));
+   message.textContent=context.runners.some(r=>fresh.has(r.id)&&healthy(r))?'状态已刷新，请选择健康空闲的 Runner。'+(failed?' 部分 Runner 离线，不影响使用其他 Runner。':''):'暂无健康空闲 Runner，请稍后刷新状态。';
+   if(infos.length)message.textContent+=` 本次实时采集 ${infos.filter(info=>!info.cached).length} 个，复用缓存 ${infos.filter(info=>info.cached).length} 个。`;
+   clearTimeout(expiry);expiry=setTimeout(()=>{fresh.clear();controls();message.textContent=window.fleetSelectionReady?'当前 Runner 已选择；切换前请重新刷新状态。':'状态已过期，请刷新后再选择。'},60000);
+  }catch(e){message.textContent=e.message}finally{refreshing=false;controls()}
  };
  use.onclick=async()=>{
-  try{if(Date.now()>freshUntil||!fresh.has(select.value))throw Error('请先刷新状态，再选择 Runner');const id=select.value;if(!id)throw Error('请选择 Runner');use.disabled=true;message.textContent='正在确认 Runner 仍健康空闲…';await request('/api/user/select',{runner_id:id});location.assign('/r/'+id+'/#'+(mode==='performance'?'performance':'accuracy'))}catch(e){message.textContent=e.message;gate(false);controls()}
+  if(selecting)return;
+  try{if(Date.now()>freshUntil||!fresh.has(select.value))throw Error('请先刷新状态，再选择 Runner');const id=select.value;if(!id)throw Error('请选择 Runner');selecting=true;controls();message.textContent='正在确认 Runner 仍健康空闲…';await request('/api/user/select',{runner_id:id});message.textContent='Runner 已确认空闲，正在打开评测页面…';if(current===id)location.reload();else location.assign('/r/'+id+'/#'+(mode==='performance'?'performance':'accuracy'))}catch(e){message.textContent=e.message;gate(false)}finally{selecting=false;controls()}
  };
- (async()=>{try{context=await request('/api/user/bootstrap');draw();if(current&&context.selected_runner_id===current){const r=context.runners.find(r=>r.id===current);if(r&&healthy(r)){fresh.add(current);freshUntil=Date.now()+60000;draw();select.value=current;gate(true);message.textContent='已选择 Runner，继续配置推理服务。';controls()}}}catch(e){message.textContent=e.message}finally{ready()}})();
- async function syncRegistry(){if(!context||busy||refreshing)return;try{const selected=select.value;context=await request('/api/user/bootstrap');fresh=new Set([...fresh].filter(id=>context.runners.some(r=>r.id===id)));draw();if(context.runners.some(r=>r.id===selected))select.value=selected;if(current&&!context.runners.some(r=>r.id===current&&healthy(r))){gate(false);message.textContent='当前 Runner 已被移除或不可用，请重新选择。'}controls()}catch(e){message.textContent=e.message}}
+ (async()=>{try{context=await request('/api/user/bootstrap');draw();if(current&&(context.selected_runner_id===current||context.selected_runner_ids?.includes(current))){const r=context.runners.find(r=>r.id===current);if(r&&healthy(r)){fresh.add(current);freshUntil=Date.now()+60000;draw();select.value=current;gate(true);message.textContent='已选择 Runner，继续配置推理服务。';controls()}}}catch(e){message.textContent=e.message}finally{ready()}})();
+ async function syncRegistry(){if(!context||busy||refreshing||selecting)return;try{const selected=select.value,next=await request('/api/user/bootstrap');if(busy||refreshing||selecting)return;context=next;fresh=new Set([...fresh].filter(id=>context.runners.some(r=>r.id===id)));draw();if(context.runners.some(r=>r.id===selected))select.value=selected;if(current&&!context.runners.some(r=>r.id===current&&reachable(r))){gate(false);message.textContent='当前 Runner 已被移除或不可用，请重新选择。'}controls()}catch(e){if(!busy)message.textContent=e.message}}
  window.addEventListener('focus',syncRegistry);
  window.addEventListener('pageshow',syncRegistry);
  window.addEventListener('load',()=>{if(location.hash==='#performance')switchMode('performance')});

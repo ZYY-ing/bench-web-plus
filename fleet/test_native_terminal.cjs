@@ -1,0 +1,13 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync(__dirname+'/runner-overlay/scripts/runner-client.js','utf8');
+const fn=source.match(/function splitNativeTerminal\(log\)\{[\s\S]*?\n\}/)[0];
+const split=vm.runInNewContext(fn+';splitNativeTerminal');
+const begin='[Runner terminal frame begin]\n',end='\n[Runner terminal frame end]';
+let result=split('native error before\n'+begin+'original curses screen 7/20'+end+'\nnative traceback after');
+assert.equal(result.frame,'original curses screen 7/20');assert.match(result.log,/native error before/);assert.match(result.log,/native traceback after/);assert.doesNotMatch(result.log,/7\/20/);
+result=split('native log\n'+begin+'partial screen');assert.equal(result.frame,null);assert.equal(result.log,'native log\n');
+result=split('truncated screen'+end+'\noriginal error');assert.equal(result.log,'\noriginal error');
+result=split(begin+'old screen'+end+'\n'+begin+'latest screen'+end);assert.equal(result.frame,'latest screen');
+assert.equal(split('original traceback without a terminal').log,'original traceback without a terminal');
+assert.match(source,/progressBar'\)\.style\.width=r.status==='running'\?'45%'/);
+console.log('Native terminal frames and source logs separated; partial/tail frames handled; top progress unchanged.');
