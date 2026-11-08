@@ -5,6 +5,7 @@ import json
 from pathlib import Path, PurePosixPath
 import tarfile
 import zipfile
+from .publication import excluded, published_bytes, public_metadata
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -48,9 +49,13 @@ def build():
                 raise ValueError('Unsafe release archive')
             if member.name == 'ascend-bench-kit/fleet-release.json':
                 continue
+            relative = '/'.join(parts[1:])
+            if excluded(relative):
+                continue
+            public_metadata(member)
             replacement = overlay.joinpath(*parts[1:])
             if member.isfile():
-                raw = overlay_bytes(replacement) if replacement.is_file() else source.extractfile(member).read()
+                raw = published_bytes(relative, overlay_bytes(replacement) if replacement.is_file() else source.extractfile(member).read())
                 member.size = len(raw)
                 relative = '/'.join(parts[1:])
                 validate_wheel(relative, raw)
@@ -66,9 +71,9 @@ def build():
             if not replacement.is_file():
                 continue
             relative = replacement.relative_to(overlay).as_posix()
-            if relative in included or '__pycache__' in replacement.parts:
+            if relative in included or excluded(relative):
                 continue
-            raw = overlay_bytes(replacement)
+            raw = published_bytes(relative, overlay_bytes(replacement))
             validate_wheel(relative, raw)
             member = tarfile.TarInfo('ascend-bench-kit/' + relative)
             member.size, member.mode, member.mtime = len(raw), 0o644, 0

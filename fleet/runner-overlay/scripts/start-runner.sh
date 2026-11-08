@@ -16,7 +16,7 @@ export ASCEND_BENCH_API_ONLY=1
 # The Runner tokenizes prompts and calls HTTP APIs; it does not initialize NPU
 # devices. Match the AISBench child environment before any Python import.
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-# Runner 与测试请求全部直连本机/内网服务，不走企业代理（否则 504 HIS Proxy Notification）
+# Runner 与测试请求全部直连本机/内网服务，不走企业代理（否则 504 proxy error page）
 export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY=
 export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 

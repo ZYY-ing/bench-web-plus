@@ -10,3 +10,15 @@ outputs/
 wheelhouse*/
 # Local machine-specific operations and private experiment material are not releases.
 /tools/
+.env
+.env.*
+!.env.example
+runner-token
+runner-config.json
+pip.conf
+bench-venv/
+cache/
+results/
+*-key.pem
+id_rsa*
+id_ed25519*

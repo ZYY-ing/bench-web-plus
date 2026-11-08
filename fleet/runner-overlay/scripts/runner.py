@@ -1178,8 +1178,8 @@ def run_job(record):
             env['ASCEND_BENCH_HOME'] = str(BASE)
             env['AIS_BENCH_WARMUP_MAX_OUT_LEN'] = str(warmup.get('max_out_len') or c['max_out_len'])
             no_proxy = '127.0.0.1,localhost,' + CONFIG['service']['host']
-            # 清空代理变量：内网环境容器常带 http_proxy（NetentSec 类中间人），
-            # 测试请求打本机/内网服务必须直连，否则 504（HIS Proxy Notification）。
+            # 清空代理变量：内网环境容器常带 http_proxy（enterprise proxy 类中间人），
+            # 测试请求打本机/内网服务必须直连，否则 504（proxy error page）。
             env.update(TORCH_DEVICE_BACKEND_AUTOLOAD='0', PYTHONDONTWRITEBYTECODE='1', HOME=str(BASE), TMPDIR=str(BASE / 'tmp'), HF_HOME=str(BASE / 'cache/huggingface'), XDG_CACHE_HOME=str(BASE / 'cache'), NO_PROXY=no_proxy, no_proxy=no_proxy, http_proxy='', https_proxy='', HTTP_PROXY='', HTTPS_PROXY='', AIS_BENCH_TOTAL_TIMEOUT=request_timeout_env(c))
             # Load this release's timeout/error patch even when reusing an AISBench
             # executable installed by an older release or elsewhere in the container.
