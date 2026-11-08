@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path, PurePosixPath
 import tarfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -13,6 +14,21 @@ def overlay_bytes(path):
     if path.suffix.lower() in {'.py', '.js', '.css', '.html', '.sh', '.json', '.txt', '.md', '.toml', '.cfg', '.ini'}:
         raw = raw.replace(b'\r\n', b'\n')
     return raw
+
+
+def validate_wheel(relative, raw):
+    """Reject broken embedded packages before publishing a release archive."""
+    if not relative.endswith('.whl'):
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as wheel:
+            if not wheel.infolist():
+                raise ValueError('empty wheel')
+            bad = wheel.testzip()
+            if bad:
+                raise ValueError('CRC mismatch: ' + bad)
+    except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ValueError('Invalid release wheel ' + relative + ': ' + str(exc)) from exc
 
 
 def build():
@@ -37,6 +53,7 @@ def build():
                 raw = overlay_bytes(replacement) if replacement.is_file() else source.extractfile(member).read()
                 member.size = len(raw)
                 relative = '/'.join(parts[1:])
+                validate_wheel(relative, raw)
                 included.add(relative)
                 if relative.startswith(('scripts/', 'website/')):
                     runtime[relative] = hashlib.sha256(raw).hexdigest()
@@ -52,6 +69,7 @@ def build():
             if relative in included or '__pycache__' in replacement.parts:
                 continue
             raw = overlay_bytes(replacement)
+            validate_wheel(relative, raw)
             member = tarfile.TarInfo('ascend-bench-kit/' + relative)
             member.size, member.mode, member.mtime = len(raw), 0o644, 0
             target.addfile(member, io.BytesIO(raw))
