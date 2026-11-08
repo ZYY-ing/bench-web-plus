@@ -8,5 +8,6 @@
 | [部署与运行排障](CENTER_TROUBLESHOOTING.md) | Python、证书、端口、容器挂载、环境、连接、生成与结果提示 |
 | [当前交接](HANDOFF.md) | 完整会话归并、最终行为、已修复问题、实机验证、已回退方案与未完成事项 |
 | [工具与原生 AISBench 对照](experiments/2026-11-07-aisbench-tool-native-ab.md) | 匿名 A/B/C 拓扑、配置、测量结果、影响分析与结论限制 |
+| [多用户与多 Runner 持续补位测试](experiments/2026-11-08-multiuser-continuous-acceptance.md) | 60 次混合测试、5 路并行补位、互斥探测、刷新恢复及评分异常 |
 
 开发代码入口见 [fleet 说明](../fleet/README.md)。历史内容通过 Git 提交回溯，不使用旧文档或旧发行包指导新中心部署。
