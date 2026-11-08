@@ -28,13 +28,20 @@ def process(root, request, output=None):
         nonce = secrets.token_hex(32)
         path = root / 'challenges' / nonce
         path.parent.mkdir(mode=0o700, exist_ok=True)
-        # Bound stale challenges without touching any other directory.
-        for old in path.parent.iterdir():
-            if old.is_file() and not old.is_symlink() and old.stat().st_mtime < time.time() - 600:
-                old.unlink()
-        with path.open('x') as stream:
-            stream.write(str(time.time()))
-        path.chmod(0o600)
+        # Issuance/cleanup and consumption share a lock. A consumer must not
+        # remove a file between the cleanup's directory listing and stat.
+        with (root / 'challenge.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for old in path.parent.iterdir():
+                try:
+                    if not old.is_symlink() and old.is_file() and old.stat().st_mtime < time.time() - 600:
+                        old.unlink()
+                except FileNotFoundError:
+                    # Tolerate an older broker or external cleanup during upgrade.
+                    continue
+            with path.open('x') as stream:
+                stream.write(str(time.time()))
+            path.chmod(0o600)
         return {'nonce': nonce}
     if request.get('action') != 'execute':
         raise ValueError('Unsupported management request')
@@ -59,9 +66,12 @@ def process(root, request, output=None):
     # Atomic consumption prevents a signed operation being replayed concurrently.
     with (root / 'challenge.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if path.is_symlink() or not path.is_file() or time.time() - path.stat().st_mtime > 300:
-            raise ValueError('Expired or consumed challenge')
-        path.unlink()
+        try:
+            if path.is_symlink() or not path.is_file() or time.time() - path.stat().st_mtime > 300:
+                raise ValueError('Expired or consumed challenge')
+            path.unlink()
+        except FileNotFoundError:
+            raise ValueError('Expired or consumed challenge') from None
     env = {k: v for k, v in os.environ.items() if k not in ('PYTHONPATH', 'PYTHONHOME')}
     env.update(PYTHONDONTWRITEBYTECODE='1', BENCHWEB_MANAGEMENT_ROOT=str(root))
     process = subprocess.Popen([sys.executable, '-u', '-'], stdin=subprocess.PIPE, stdout=output,
