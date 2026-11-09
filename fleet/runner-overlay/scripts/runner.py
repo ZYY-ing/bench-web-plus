@@ -1012,13 +1012,18 @@ def collect(folder, record):
     record['raw_tables'] = tables
     record['result_files'] = result_files
     record['metrics'] = {'accuracy': accuracy} if record['config']['mode'] == 'accuracy' else {}
-    failed = []
+    failed_count = 0
     for path in output.rglob('*failed*.jsonl'):
         if path.is_file():
-            failed.extend(line for line in path.read_text().splitlines() if line.strip())
-    record['failed_requests'] = len(failed)
-    if failed:
-        record.setdefault('notices', []).append(f'AISBench 记录了 {len(failed)} 条失败请求；任务状态遵循原生退出结果，请查看失败请求文件')
+            # Match AISBench _summary_failed_results: parse each JSONL record.
+            # str.splitlines() also splits U+2028 inside a valid JSON string.
+            with path.open(encoding='utf-8') as stream:
+                for line in stream:
+                    json.loads(line)
+                    failed_count += 1
+    record['failed_requests'] = failed_count
+    if failed_count:
+        record.setdefault('notices', []).append(f'AISBench 记录了 {failed_count} 条失败请求；任务状态遵循原生退出结果，请查看失败请求文件')
     if record['config']['mode'] == 'accuracy' and record['config'].get('execution', {}).get('mode', 'all') in ('all', 'eval') and accuracy is None:
         record.setdefault('notices', []).append(missing_score_problem(folder))
     if record['config']['mode'] == 'performance' and not tables:

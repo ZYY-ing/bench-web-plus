@@ -72,6 +72,25 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(any('输出长度提示' in n for n in self.record['notices']))
         self.assertTrue(any('1 条失败请求' in n for n in self.record['notices']))
 
+    def test_failed_jsonl_unicode_separators_are_not_extra_requests(self):
+        failed = self.folder / 'output/predictions/model/data_failed.jsonl'
+        failed.parent.mkdir(parents=True)
+        native = ''.join(json.dumps({'id': i, 'input': 'question\u2028continued\u0085text\u2029end',
+                                   'error_info': 'HTTP 500'}, ensure_ascii=False) + '\n'
+                         for i in range(10))
+        failed.write_text(native, encoding='utf-8')
+        self.runner.collect(self.folder, self.record)
+        self.assertEqual(self.record['failed_requests'], 10)
+        self.assertTrue(any('10 条失败请求' in n for n in self.record['notices']))
+        self.assertEqual(failed.read_text(encoding='utf-8'), native)
+
+    def test_invalid_failed_jsonl_is_not_counted_as_a_native_record(self):
+        failed = self.folder / 'output/predictions/model/data_failed.jsonl'
+        failed.parent.mkdir(parents=True)
+        failed.write_text('{"id": 1}\ninvalid JSON\n', encoding='utf-8')
+        with self.assertRaises(json.JSONDecodeError):
+            self.runner.collect(self.folder, self.record)
+
     def test_native_exit_code_controls_completion_even_if_report_reader_fails(self):
         runner = self.runner
         runner.BASE = self.folder
