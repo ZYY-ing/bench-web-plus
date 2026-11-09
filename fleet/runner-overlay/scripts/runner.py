@@ -46,6 +46,8 @@ STATE_LOCK = threading.Lock()
 GENERATION = None
 GENERATION_LOCK = threading.Lock()
 OPERATION = None
+RECOVERING_JOBS = {}
+JOB_CONTEXT = threading.local()
 
 
 def operation_info(kind, service=None, **details):
@@ -55,6 +57,7 @@ def operation_info(kind, service=None, **details):
 
 def reserve_operation(kind, service=None, **details):
     global OPERATION
+    reconcile_restarted_tasks()
     info = operation_info(kind, service, **details)
     if not LOCK.acquire(blocking=False):
         return False
@@ -444,6 +447,8 @@ def dataset_worker(c, folder, count):
     save(stage / 'request.json', request)
     env = os.environ.copy()
     env.update(ASCEND_BENCH_PROCESS_ROLE='runner', ASCEND_BENCH_API_ONLY='1', TORCH_DEVICE_BACKEND_AUTOLOAD='0')
+    if getattr(JOB_CONTEXT, 'job_id', None):
+        env['ASCEND_BENCH_JOB_ID'] = JOB_CONTEXT.job_id
     try:
         with (stage / 'worker.log').open('w') as log:
             process = subprocess.Popen([sys.executable, '-u', str(BASE / 'scripts/dataset_worker.py'), str(stage)], env=env,
@@ -1087,6 +1092,7 @@ def wait_process_group_stopped(pgid):
 def reconcile_finished_task():
     """A status refresh can finish deferred cleanup without administrator action."""
     global ACTIVE_JOB, SAFE_IDLE
+    reconcile_restarted_tasks()
     with STATE_LOCK:
         record = ACTIVE_JOB
         if not record or record.get('status') != 'unknown' or record['id'] in PROCESSES:
@@ -1106,15 +1112,119 @@ def reconcile_finished_task():
         release_operation()
 
 
+def recovery_identity(pid=None):
+    """Scope PID evidence to its boot/namespace; never signal a recovered PID."""
+    identity = {}
+    try:
+        identity['boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        identity['pid_namespace'] = os.readlink('/proc/self/ns/pid')
+        if pid:
+            identity['start_ticks'] = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        pass
+    return identity
+
+
+def restarted_job_stopped(record, proc_root=Path('/proc')):
+    """Read-only proof covering the old group and escaped tagged descendants."""
+    job_id = record.get('id', '')
+    if not re.fullmatch(r'real-[a-z0-9-]+', job_id):
+        return None
+    pid = record.get('pid')
+    saved = record.get('recovery_identity', {})
+    current = recovery_identity(pid)
+    changed_scope = any(saved.get(k) and current.get(k) and saved[k] != current[k] for k in ('boot_id', 'pid_namespace'))
+    reused_pid = saved.get('start_ticks') and current.get('start_ticks') and saved['start_ticks'] != current['start_ticks']
+    if pid and not changed_scope and not reused_pid:
+        group = process_group_running(pid, proc_root)
+        if group is not False:
+            return False if group is True else None
+    elif not pid and not saved:
+        return None  # Legacy preparation without launch identity is not proof of exit.
+    try:
+        entries = list(proc_root.iterdir())
+        folder = str(RUNS / job_id).encode()
+        tag = b'ASCEND_BENCH_JOB_ID=' + job_id.encode()
+        for entry in entries:
+            if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+                continue
+            try:
+                state = (entry / 'stat').read_text().rsplit(')', 1)[1].split()[0]
+                if state in ('Z', 'X', 'x'):
+                    continue
+                if folder in (entry / 'cmdline').read_bytes() or tag in (entry / 'environ').read_bytes().split(b'\0'):
+                    return False
+            except FileNotFoundError:
+                continue
+        if {p.name for p in proc_root.iterdir() if p.name.isdecimal()} != {p.name for p in entries if p.name.isdecimal()}:
+            return None  # A fork/exit raced the scan; retry on the next refresh.
+        return True
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def reconcile_restarted_tasks():
+    global ACTIVE_JOB, SAFE_IDLE, OPERATION
+    if not RECOVERING_JOBS:
+        return
+    with STATE_LOCK:
+        if not RECOVERING_JOBS:
+            return
+        if not LOCK.locked():
+            if not LOCK.acquire(blocking=False):
+                return
+        elif OPERATION and OPERATION.get('kind') != 'recovery':
+            return
+        SAFE_IDLE = False
+        OPERATION = operation_info('recovery', label='自动核对中断任务')
+        for job_id, record in list(RECOVERING_JOBS.items()):
+            proof = restarted_job_stopped(record)
+            request_id = record.get('fleet_request_id')
+            if proof is not True:
+                if request_id:
+                    FLEET_REQUESTS[request_id] = {'state': 'recovering', 'job_id': job_id,
+                                                'reason': 'old_process_alive' if proof is False else 'exit_not_verified'}
+                continue
+            terminal = record.get('terminal_status')
+            if terminal not in ('completed', 'failed', 'stopped') or not record.get('completed_at'):
+                terminal = 'interrupted'
+                record['error'] = 'Runner 重启导致任务中断；已自动确认原任务进程退出，结果文件保留'
+            now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            record.update(status=terminal, terminal_status=terminal, completed_at=record.get('completed_at') or now,
+                          recovery_completed_at=now, process_tree_confirmed_stopped=True)
+            save(RUNS / job_id / 'record.json', record)
+            if request_id:
+                FLEET_REQUESTS[request_id] = {'state': 'finished', 'job_id': job_id, 'restored_after_restart': True,
+                                            'terminal_status': terminal, 'completed_at': record['completed_at'],
+                                            'process_tree_confirmed_stopped': True}
+            cleanup_dataset_memory(job_id)
+            del RECOVERING_JOBS[job_id]
+        ACTIVE_JOB = next(iter(RECOVERING_JOBS.values()), None)
+        if not RECOVERING_JOBS:
+            SAFE_IDLE = True
+            release_operation()
+
+
+def restore_restarted_tasks():
+    for path in RUNS.glob('*/record.json'):
+        data = json.loads(path.read_text())
+        if data.get('status') in ('running', 'unknown', 'interrupted') and not (
+                data.get('status') == 'interrupted' and data.get('process_tree_confirmed_stopped') is True):
+            RECOVERING_JOBS[data['id']] = data
+    reconcile_restarted_tasks()
+
+
 def restore_finished_requests():
     """Retain terminal request receipts across an idle Runner upgrade/restart."""
     for path in RUNS.glob('*/record.json'):
         data = json.loads(path.read_text())
         request_id = data.get('fleet_request_id')
-        if not request_id or data.get('status') not in ('completed', 'failed', 'stopped') or not data.get('completed_at'):
+        if not request_id or data.get('status') not in ('completed', 'failed', 'stopped', 'interrupted') or not data.get('completed_at'):
             continue
-        # These terminal states are written only after group cleanup. Unknown
-        # or interrupted tasks are deliberately excluded from this receipt.
+        if data['status'] == 'interrupted' and data.get('process_tree_confirmed_stopped') is not True:
+            continue
+        # Interrupted records need an explicit persisted exit proof above.
+        # Unknown/unverified restart records never become terminal receipts.
         if data.get('terminal_status') != data['status']:
             continue
         FLEET_REQUESTS[request_id] = {'state': 'finished', 'job_id': data['id'], 'restored_after_restart': True,
@@ -1125,6 +1235,7 @@ def restore_finished_requests():
 def run_job(record):
     global ACTIVE_JOB, SAFE_IDLE
     folder = RUNS / record['id']
+    JOB_CONTEXT.job_id = record['id']
     log_path = folder / 'execution.log'
     try:
         c = record['config']
@@ -1205,6 +1316,7 @@ def run_job(record):
             process = subprocess.Popen(argv, cwd=run_cwd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             PROCESSES[record['id']] = process
             record['pid'] = process.pid
+            record['recovery_identity'] = recovery_identity(process.pid)
             save(folder / 'record.json', record)
             code = process.wait()
             record['exit_code'] = code
@@ -1322,7 +1434,7 @@ class Handler(SimpleHTTPRequestHandler):
                     'protocol_version': 2, 'version': 'fleet-v3', 'instance_id': INSTANCE_ID,
                     'source_sha256': SOURCE_SHA256, 'health': 'healthy',
                     'root': str(BASE), 'container': CONFIG['container'],
-                    'activity': ('running' if ACTIVE_JOB else 'preparing') if LOCK.locked() else 'idle',
+                    'activity': 'recovering' if RECOVERING_JOBS else (('running' if ACTIVE_JOB else 'preparing') if LOCK.locked() else 'idle'),
                     'operation': OPERATION if LOCK.locked() else None,
                     'active_job': {'id': ACTIVE_JOB['id'], 'mode': ACTIVE_JOB['config'].get('mode'),
                                    'target': {k: ACTIVE_JOB['config'].get(k) for k in ('host', 'port', 'model')}} if ACTIVE_JOB else None,
@@ -1498,6 +1610,7 @@ class Handler(SimpleHTTPRequestHandler):
                     count = validate(body)
                     job_id = 'real-' + str(int(time.time())) + '-' + secrets.token_hex(4)
                     record = dict(id=job_id, demo=False, status='running', created_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), config=body, count=count, metrics=None, exit_code=None, log='')
+                    record['recovery_identity'] = recovery_identity()
                     record['fleet_request_id'] = fleet_request_id
                     save(RUNS / job_id / 'record.json', record)
                     if fleet_request_id:
@@ -1544,12 +1657,7 @@ if __name__ == '__main__':
     PORT = args.port
     RUNS.mkdir(parents=True, exist_ok=True)
     restore_finished_requests()
-    for path in RUNS.glob('*/record.json'):
-        data = json.loads(path.read_text())
-        if data['status'] == 'running':
-            data['status'] = 'interrupted'
-            data['error'] = 'Runner restarted; inspect existing process before retrying'
-            save(path, data)
+    restore_restarted_tasks()
     token_path = BASE / 'runner-token'
     if not token_path.is_file():
         token_path.write_text(secrets.token_urlsafe(32))

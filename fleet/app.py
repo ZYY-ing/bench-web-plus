@@ -141,6 +141,8 @@ class Console:
         self.refresh_versions = {}
         self.refresh_samples = {}
         self.refresh_durations = {}
+        self.reconcile_stop = threading.Event()
+        self.reconcile_thread = None
         from .storage_cleanup import StorageCleanup
         self.storage_cleanup = StorageCleanup(self)
         if demo and not self.store.list('runner'):
@@ -469,8 +471,37 @@ class Console:
             reason = re.sub(r'^(ValueError|RuntimeError):\s*', '', reason)
             step(state, '部署未完成：' + reason)
 
+    def runner_view(self, runner):
+        result = {k: v for k, v in runner.items() if k != 'token'}
+        request_id = self.store.request_for(runner['id'])
+        if request_id:
+            info = self.store.conflict_info(runner['id'], '')
+            result['occupancy'] = {'request': request_id[:12], 'target': info['target'] if info else '',
+                                   'detail': '中心保留任务占用，正在自动核对退出状态'}
+            result['status'] = {**runner['status']}
+            if result['status'].get('activity') == 'idle':
+                result['status']['activity'] = 'recovering'
+        return result
+
     def runners(self):
-        return [{**{k: v for k, v in r.items() if k != 'token'}, 'access_configured':self.transport.channels.has(r['spec'])} for r in self.store.list('runner')]
+        return [{**self.runner_view(r), 'access_configured':self.transport.channels.has(r['spec'])} for r in self.store.list('runner')]
+
+    def start_reconciliation(self):
+        """Poll claimed runners outside HTTP handlers and deployment workers."""
+        if self.demo or self.reconcile_thread:
+            return
+        def loop():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                pending = {}
+                while not self.reconcile_stop.is_set():
+                    pending = {rid: future for rid, future in pending.items() if not future.done()}
+                    for row in self.store.list('runner'):
+                        rid = row['id']
+                        if rid not in pending and self.store.request_for(rid):
+                            pending[rid] = pool.submit(self.refresh, rid, True)
+                    self.reconcile_stop.wait(5)
+        self.reconcile_thread = threading.Thread(target=loop, name='claim-reconciliation', daemon=True)
+        self.reconcile_thread.start()
 
     def user_view(self):
         profiles = [{**{k: p[k] for k in ('id', 'name', 'host', 'connected')}, 'connected': p['connected'] or self.transport.channels.has_profile(p['id'])} for p in self.public_profiles()]
@@ -478,7 +509,8 @@ class Console:
         runners = [{'id': r['id'], 'spec': {k: r['spec'][k] for k in ('profile_id', 'port', 'container')},
                     'status': {**{k: r['status'].get(k) for k in ('activity', 'version')},
                                'active_job': {'target': {k: (r['status'].get('active_job') or {}).get('target', {}).get(k) for k in ('host', 'port', 'model')}} if r['status'].get('active_job') else None},
-                    'access_configured': r['access_configured'], 'observed_at': r['observed_at'], 'error': '连接待管理员恢复' if r.get('error') else ''}
+                    'access_configured': r['access_configured'], 'observed_at': r['observed_at'], 'error': '连接待管理员恢复' if r.get('error') else '',
+                    **({'occupancy': r['occupancy']} if r.get('occupancy') else {})}
                    for r in entries]
         return {'demo': self.demo, 'profiles': profiles, 'runners': runners}
 
@@ -504,7 +536,7 @@ class Console:
             # Requests that arrived during a collection share its result, even
             # if that collection took longer than the cache window or failed.
             if version > requested_version or (version and not force and (cached_row.get('error') or cached_row['status'].get('activity') == 'idle') and time.monotonic() - observed < self.refresh_info(runner_id)['cache_window_seconds']):
-                return {**cached_row, 'refresh_info': self.refresh_info(runner_id, cached=True)}
+                return {**self.runner_view(cached_row), 'refresh_info': self.refresh_info(runner_id, cached=True)}
             started = time.monotonic()
             result = self.refresh_once(runner_id)
             finished = time.monotonic()
@@ -539,7 +571,7 @@ class Console:
             request_id = self.store.request_for(runner_id)
             result = status.get('fleet_requests', {}).get(request_id, {})
             restored_terminal = (result.get('restored_after_restart') is True and result.get('process_tree_confirmed_stopped') is True
-                                 and result.get('terminal_status') in ('completed', 'failed', 'stopped') and bool(result.get('job_id')) and bool(result.get('completed_at')))
+                                 and result.get('terminal_status') in ('completed', 'failed', 'stopped', 'interrupted') and bool(result.get('job_id')) and bool(result.get('completed_at')))
             if not self.demo and (status.get('instance_id') == old.get('instance_id') or restored_terminal) and status.get('activity') == 'idle' and status.get('process_tree_confirmed_stopped') and result.get('state') in ('finished', 'rejected'):
                 self.store.release(runner_id, request_id)
         except Exception as exc:
@@ -549,7 +581,7 @@ class Console:
             if latest['spec'] != runner['spec']:
                 return {k:v for k,v in latest.items() if k != 'token'}
             self.store.save('runner', runner)
-        return {k: v for k, v in runner.items() if k != 'token'}
+        return self.runner_view(runner)
 
     def recover_completed_task(self, runner_id):
         with self.mutex:
@@ -626,6 +658,9 @@ class Console:
         spec = runner['spec']
         profile = self.transport.profiles[spec['profile_id']]
         if method == 'POST':
+            reservation = self.store.conflict_info(runner_id, '')
+            if reservation and reservation['target'].startswith('maintenance-') and not path.endswith('/stop'):
+                raise ValueError('Runner 正在安全更新，请稍后刷新状态；当前任务不会被停止')
             if path == '/api/login':
                 raise ValueError('中心入口不支持 Runner 凭据登录')
             if path == '/api/config':
@@ -1073,6 +1108,7 @@ def main():
         server.tls_context = context
     server.daemon_threads = True
     server.app = app
+    app.start_reconciliation()
     print('中心地址：' + (args.public_url or f"{'https' if args.cert else 'http'}://127.0.0.1:{args.port}"), flush=True)
     print(f'凭据文件：{app.directory / "console-token"}（请在本机读取并登录）', flush=True)
     print('模式：' + ('演示，不连接服务器' if args.demo else '真实 SSH 部署'), flush=True)
@@ -1082,6 +1118,7 @@ def main():
         pass
     finally:
         server.server_close()
+        app.reconcile_stop.set()
         app.transport.close()
         app.executor.shutdown(wait=False)
 

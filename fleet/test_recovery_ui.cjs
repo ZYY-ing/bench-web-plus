@@ -1,0 +1,17 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const picker=fs.readFileSync('fleet/static/fleet-picker.js','utf8');
+const admin=fs.readFileSync('fleet/static/app.js','utf8');
+const context=vm.createContext({context:{profiles:[{id:'a',connected:true}]},profileFor:()=>({connected:true}),reachable:()=>true});
+for(const name of ['healthy','availability'])vm.runInContext(picker.split('\n').find(s=>s.includes('function '+name+'(')),context);
+vm.runInContext(admin.split('\n').find(s=>s.includes('function statusFor(')),context);
+context.r={spec:{profile_id:'a'},access_configured:true,status:{activity:'idle'},occupancy:{target:'192.0.2.5:8000'}};
+assert.equal(vm.runInContext('healthy(r)',context),false);
+assert.match(vm.runInContext('availability(r)',context),/占用待自动核对.*192.0.2.5:8000/);
+assert.match(vm.runInContext('statusFor(r)[0]',context),/占用待自动核对/);
+context.r.status.activity='recovering';delete context.r.occupancy;
+assert.equal(vm.runInContext('healthy(r)',context),false);
+assert.match(vm.runInContext('availability(r)',context),/自动核对/);
+context.r.status.activity='idle';
+assert.equal(vm.runInContext('healthy(r)',context),true);
+assert.match(vm.runInContext('availability(r)',context),/健康.*空闲/);
+console.log('Recovery visibility: claimed idle and orphan recovery are unavailable; proven released idle is selectable.');
